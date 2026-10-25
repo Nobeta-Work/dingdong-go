@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin" // 注册 DNS 多地址的轮询策略。
@@ -24,10 +26,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/auth"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/config"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/fault"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/httpx"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/metrics"
 )
 
 // Spec 只描述各服务实际使用的依赖，不让公共启动层理解业务数据。
@@ -50,6 +56,8 @@ type Runtime struct {
 	PaymentConn *grpc.ClientConn
 	Logger      *slog.Logger
 	Redis       *redis.Client
+	Metrics     *metrics.Registry
+	Faults      *fault.Engine
 }
 
 // Run 装配依赖、启动监听并在退出信号到来时排空在途请求。
@@ -60,6 +68,19 @@ func Run(spec Spec) error {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", spec.Name, "instance", os.Getenv("HOSTNAME"))
 	slog.SetDefault(logger)
+	registry := metrics.New()
+	bootID := uuid.NewString()
+	prefix := strings.TrimSuffix(spec.Name, "-service")
+	points := map[string][]string{
+		"trade":   {"before_outbox_send", "after_outbox_send", "after_prehold", "after_accept_commit", "after_order_commit"},
+		"payment": {"before_outbox_send", "after_outbox_send", "before_query", "after_create_commit", "after_close_commit"},
+		"catalog": {"before_confirm", "before_release", "before_reserve", "after_reserve_commit", "after_confirm_commit", "after_release_commit"},
+	}
+	var allowed []string
+	for _, point := range points[prefix] {
+		allowed = append(allowed, prefix+"."+point)
+	}
+	faults := fault.New(cfg.DemoFaults, registry, allowed...)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -101,6 +122,21 @@ func Run(spec Spec) error {
 		for name, target := range map[string]string{"catalog_rpc": cfg.CatalogTarget, "payment_rpc": cfg.PaymentTarget} {
 			// ClientConn 长期复用。写操作未来显式指定业务重试，不安装全局重试拦截器。
 			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoke grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+					started := time.Now()
+					if trace := httpx.TraceID(ctx); trace != "" {
+						ctx = metadata.AppendToOutgoingContext(ctx, "x-trace-id", trace)
+					}
+					err := invoke(ctx, method, req, reply, cc, opts...)
+					registry.Observe("rpc.client.latency", time.Since(started))
+					if err != nil {
+						registry.Add("rpc.client.failures", 1)
+					}
+					if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+						registry.Add("rpc.client.timeouts", 1)
+					}
+					return err
+				}),
 				grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`))
 			if err != nil {
 				return fmt.Errorf("创建 %s 连接: %w", name, err)
@@ -126,13 +162,35 @@ func Run(spec Spec) error {
 		return fmt.Errorf("依赖未就绪: %v", failed)
 	}
 	var draining atomic.Bool
-	router := httpx.NewRouter(logger)
+	router := httpx.NewRouter(logger, registry)
+	faults.Register(router, cfg.JWTSecret)
+	router.GET("/api/admin/diagnostics", auth.Require(cfg.JWTSecret, true), func(c *gin.Context) {
+		httpx.Write(c, 200, "OK", "当前实例指标", gin.H{"service": spec.Name, "instance": os.Getenv("HOSTNAME"), "bootId": bootID, "paymentWindowMs": cfg.PaymentWindow.Milliseconds(), "metrics": registry.Snapshot(),
+			"demoFaultsEnabled": cfg.DemoFaults, "userBurst": cfg.UserBurst, "userRate": cfg.UserRate, "activityBurst": cfg.ActivityBurst, "activityRate": cfg.ActivityRate})
+	})
 	rpcServer := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		started := time.Now()
 		reply, err := handler(ctx, req)
+		registry.Observe("rpc.latency", time.Since(started))
+		if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+			registry.Add("rpc.timeouts", 1)
+		}
+		registry.Add("rpc.calls", 1)
 		if err == nil {
 			return reply, nil
 		}
-		logger.Warn("rpc_failed", "method", info.FullMethod, "error", err)
+		trace := ""
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if values := md.Get("x-trace-id"); len(values) > 0 {
+				trace = values[0]
+			}
+		}
+		orderNo := ""
+		if key, ok := req.(interface{ GetOrderNo() string }); ok {
+			orderNo = key.GetOrderNo()
+		}
+		logger.Warn("rpc_failed", "method", info.FullMethod, "traceId", trace, "orderNo", orderNo, "category", status.Code(err).String(), "error", err)
+		registry.Add("rpc.failures", 1)
 		if _, ok := status.FromError(err); ok {
 			return nil, err
 		}
@@ -152,7 +210,7 @@ func Run(spec Spec) error {
 	businessStopped := false
 	if spec.Configure != nil {
 		stopBusiness, err = spec.Configure(&Runtime{Config: cfg, DB: db, Router: router, RPC: rpcServer,
-			CatalogConn: connections["catalog_rpc"], PaymentConn: connections["payment_rpc"], Logger: logger, Redis: rdb})
+			CatalogConn: connections["catalog_rpc"], PaymentConn: connections["payment_rpc"], Logger: logger, Redis: rdb, Metrics: registry, Faults: faults})
 		if err != nil {
 			return fmt.Errorf("装配业务: %w", err)
 		}
@@ -182,7 +240,7 @@ func Run(spec Spec) error {
 			httpx.Write(c, 503, "DEPENDENCY_UNAVAILABLE", "依赖尚未就绪", failed)
 			return
 		}
-		httpx.Write(c, 200, "OK", "服务就绪", gin.H{"service": spec.Name, "stage": "M1"})
+		httpx.Write(c, 200, "OK", "服务就绪", gin.H{"service": spec.Name, "stage": "M2"})
 	})
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
@@ -206,7 +264,7 @@ func Run(spec Spec) error {
 		go func() { serverErrors <- rpcServer.Serve(listener) }()
 	}
 	go func() { serverErrors <- httpServer.Serve(httpListener) }()
-	logger.Info("service_started", "httpAddr", cfg.HTTPAddr, "rpcEnabled", spec.RPC, "stage", "M1")
+	logger.Info("service_started", "httpAddr", cfg.HTTPAddr, "rpcEnabled", spec.RPC, "stage", "M2")
 	var serveErr error
 	select {
 	case <-ctx.Done():

@@ -9,6 +9,10 @@ import (
 	catalogpb "github.com/Nobeta-Work/dingdong-go/api/gen/catalog/v1"
 	paymentpb "github.com/Nobeta-Work/dingdong-go/api/gen/payment/v1"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/app"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/config"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/fault"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/metrics"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/work"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -21,11 +25,16 @@ type service struct {
 	window    time.Duration
 	redis     *redis.Client
 	logger    *slog.Logger
+	metrics   *metrics.Registry
+	faults    *fault.Engine
+	config    config.Config
+	cache     *activityCache
+	jobs      *work.Queue
 }
 
 func newService(r *app.Runtime) *service {
 	return &service{db: r.DB, catalog: catalogpb.NewCatalogClient(r.CatalogConn), inventory: catalogpb.NewInventoryClient(r.CatalogConn),
-		payment: paymentpb.NewPaymentClient(r.PaymentConn), window: r.Config.PaymentWindow, redis: r.Redis, logger: r.Logger}
+		payment: paymentpb.NewPaymentClient(r.PaymentConn), window: r.Config.PaymentWindow, redis: r.Redis, logger: r.Logger, metrics: r.Metrics, faults: r.Faults, config: r.Config}
 }
 
 type activity struct {
@@ -42,9 +51,12 @@ type activity struct {
 	Status            string    `json:"status"`
 	Phase             string    `json:"phase"`
 	ParticipationRule string    `json:"participationRule"`
+	AdmissionEpoch    string    `json:"-"`
+	AdmissionState    string    `json:"-"`
+	AdmissionRevision uint64    `json:"-"`
 }
 
-const activityColumns = "id,title,sku_id,sku_name,price_cent,quota,used_quota,starts_at,ends_at,version,status"
+const activityColumns = "id,title,sku_id,sku_name,price_cent,quota,used_quota,starts_at,ends_at,version,status,admission_epoch,admission_state,admission_revision"
 
 type request struct {
 	ID                  string   `json:"requestId"`
@@ -81,7 +93,12 @@ type rowQuerier interface {
 
 func scanActivity(row rowScanner) (activity, error) {
 	var a activity
-	err := row.Scan(&a.ID, &a.Title, &a.SKUID, &a.SKUName, &a.PriceCent, &a.Quota, &a.UsedQuota, &a.StartsAt, &a.EndsAt, &a.Version, &a.Status)
+	err := row.Scan(&a.ID, &a.Title, &a.SKUID, &a.SKUName, &a.PriceCent, &a.Quota, &a.UsedQuota, &a.StartsAt, &a.EndsAt, &a.Version, &a.Status, &a.AdmissionEpoch, &a.AdmissionState, &a.AdmissionRevision)
+	activityPhase(&a)
+	return a, err
+}
+
+func activityPhase(a *activity) {
 	a.Phase = "ACTIVE"
 	if time.Now().Before(a.StartsAt) {
 		a.Phase = "UPCOMING"
@@ -89,7 +106,6 @@ func scanActivity(row rowScanner) (activity, error) {
 		a.Phase = "ENDED"
 	}
 	a.ParticipationRule = "每位用户每个活动最多一张订单；订单超时只释放 SKU 库存，不恢复活动资格或额度"
-	return a, err
 }
 
 func getActivity(ctx context.Context, q rowQuerier, id string, lock bool) (activity, error) {

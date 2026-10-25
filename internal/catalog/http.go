@@ -28,7 +28,9 @@ func (s *catalogService) GetSKU(ctx context.Context, in *pb.GetSKURequest) (*pb.
 func configure(r *app.Runtime) (func(context.Context) error, error) {
 	s := &catalogService{db: r.DB}
 	pb.RegisterCatalogServer(r.RPC, s)
-	pb.RegisterInventoryServer(r.RPC, &inventoryService{db: r.DB})
+	inventory := &inventoryService{db: r.DB, faults: r.Faults}
+	pb.RegisterInventoryServer(r.RPC, inventory)
+	registerDemo(r, inventory)
 	r.Router.GET("/api/skus/:id", func(c *gin.Context) {
 		sku, err := s.GetSKU(c.Request.Context(), &pb.GetSKURequest{SkuId: c.Param("id")})
 		if err != nil {

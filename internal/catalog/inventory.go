@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
+
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/fault"
 
 	pb "github.com/Nobeta-Work/dingdong-go/api/gen/catalog/v1"
 	"google.golang.org/grpc/codes"
@@ -14,7 +17,8 @@ import (
 // ! 所有业务拒绝返回明确状态码；网络错误由交易服务按 orderNo 回查，不能当成缺货。
 type inventoryService struct {
 	pb.UnimplementedInventoryServer
-	db *sql.DB
+	db     *sql.DB
+	faults *fault.Engine
 }
 
 func (s *inventoryService) Reserve(ctx context.Context, in *pb.InventoryRequest) (*pb.Reservation, error) {
@@ -26,6 +30,9 @@ func (s *inventoryService) Release(ctx context.Context, in *pb.InventoryRequest)
 }
 
 func (s *inventoryService) Confirm(ctx context.Context, in *pb.ReservationRequest) (*pb.Reservation, error) {
+	if err := s.faults.Hit(ctx, "catalog.before_confirm", in.OrderNo); err != nil {
+		return nil, err
+	}
 	if in.OrderNo == "" || in.SkuId == "" {
 		return nil, status.Error(codes.InvalidArgument, "缺少业务键")
 	}
@@ -52,7 +59,10 @@ func (s *inventoryService) Confirm(ctx context.Context, in *pb.ReservationReques
 		}
 	}
 	r.Status = pb.ReservationStatus_RESERVATION_STATUS_CONFIRMED
-	return r, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return r, s.faults.Hit(ctx, "catalog.after_confirm_commit", in.OrderNo)
 }
 
 func (s *inventoryService) GetReservation(ctx context.Context, in *pb.ReservationRequest) (*pb.Reservation, error) {
@@ -61,6 +71,9 @@ func (s *inventoryService) GetReservation(ctx context.Context, in *pb.Reservatio
 }
 
 func (s *inventoryService) change(ctx context.Context, in *pb.InventoryRequest, action string) (*pb.Reservation, error) {
+	if err := s.faults.Hit(ctx, "catalog.before_"+strings.ToLower(action), in.OrderNo); err != nil {
+		return nil, err
+	}
 	if in.OrderNo == "" || len(in.OrderNo) > 64 || in.SkuId == "" || in.Quantity != 1 {
 		return nil, status.Error(codes.InvalidArgument, "业务键不能为空且数量固定为 1")
 	}
@@ -122,7 +135,11 @@ func (s *inventoryService) change(ctx context.Context, in *pb.InventoryRequest, 
 		}
 		r.Status = pb.ReservationStatus_RESERVATION_STATUS_RELEASED
 	}
-	return r, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	// * 故障发生在提交之后，用于演示“服务已写入、调用方未收到结果”的回查窗口。
+	return r, s.faults.Hit(ctx, "catalog.after_"+strings.ToLower(action)+"_commit", in.OrderNo)
 }
 
 type rowQuerier interface {

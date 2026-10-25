@@ -10,6 +10,7 @@ import (
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/auth"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/event"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/httpx"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/work"
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,18 +18,29 @@ import (
 
 func configure(r *app.Runtime) (func(context.Context) error, error) {
 	s := newService(r)
+	s.cache = newActivityCache(s)
+	s.jobs = work.New(r.DB, "operation_task", r.Config.RetryLimit, r.Metrics, r.Logger, s.handleTask)
 	s.routes(r)
-	bus, err := event.Start(r.DB, r.Config.Nameserver, "dingdong-trade", r.Logger, s.handleEvent)
+	s.jobs.Register(r.Router, r.Config.JWTSecret, false)
+	bus, err := event.Start(r.DB, r.Config.Nameserver, "dingdong-trade", r.Logger, s.handleEvent, event.Options{Workers: r.Config.Workers, MaxAttempts: r.Config.RetryLimit, Metrics: r.Metrics, Faults: r.Faults})
 	if err != nil {
+		s.cache.cancel()
 		return nil, err
 	}
+	bus.Register(r.Router, r.Config.JWTSecret)
+	s.jobs.Start(r.Config.Workers)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.recoverLoop(ctx, r.Logger) }()
 	return func(stopCtx context.Context) error {
 		cancel()
+		s.cache.cancel()
+		s.jobs.Stop()
 		// 同时停止 MQ 与 Outbox 领取，恢复任务的在途事务仍可完成并持久化后续事件。
 		busErr := bus.Close(stopCtx)
+		if err := s.jobs.Close(stopCtx); err != nil {
+			return err
+		}
 		select {
 		case <-done:
 			return busErr
@@ -51,22 +63,12 @@ func (s *service) routes(r *app.Runtime) {
 	})
 	r.Router.GET("/api/activities", s.listActivities)
 	r.Router.GET("/api/activities/:id", func(c *gin.Context) {
-		a, err := getActivity(c.Request.Context(), s.db, c.Param("id"), false)
-		if err == nil && a.Status != "PUBLISHED" && a.Status != "PAUSED" {
-			err = sql.ErrNoRows
-		}
+		a, err := s.cache.get(c.Request.Context(), c.Param("id"))
 		respond(c, a, err)
 	})
 	user := r.Router.Group("/api", auth.Require(r.Config.JWTSecret, false))
-	user.POST("/activities/:id/requests", func(c *gin.Context) {
-		var in struct {
-			RequestID string `json:"requestId" binding:"required,max=64"`
-		}
-		if c.ShouldBindJSON(&in) != nil {
-			httpx.Error(c, status.Error(codes.InvalidArgument, "缺少合法 requestId"))
-			return
-		}
-		result, created, err := s.submit(c.Request.Context(), c.Param("id"), c.GetString("userId"), in.RequestID, c.GetString("traceId"))
+	user.POST("/activities/:id/requests", s.requestLimit(), func(c *gin.Context) {
+		result, created, err := s.submit(c.Request.Context(), c.Param("id"), c.GetString("userId"), c.GetString("requestId"), c.GetString("traceId"))
 		if err != nil {
 			httpx.Error(c, err)
 			return
@@ -116,7 +118,44 @@ func (s *service) routes(r *app.Runtime) {
 	admin.POST("/activities/:id/publish", func(c *gin.Context) { a, err := s.publish(c.Request.Context(), c.Param("id")); respond(c, a, err) })
 	admin.POST("/activities/:id/pause", func(c *gin.Context) { a, err := s.pause(c.Request.Context(), c.Param("id")); respond(c, a, err) })
 	admin.GET("/activities/:id/stats", s.stats)
+	admin.GET("/activities/:id/admission", func(c *gin.Context) {
+		a, err := getActivity(c.Request.Context(), s.db, c.Param("id"), false)
+		if err != nil {
+			httpx.Error(c, err)
+			return
+		}
+		keys := admissionKeys(a.ID)
+		pipe := s.redis.Pipeline()
+		conf := pipe.HGetAll(c.Request.Context(), keys[0])
+		holders := pipe.HLen(c.Request.Context(), keys[1])
+		pending := pipe.ZCard(c.Request.Context(), keys[3])
+		_, err = pipe.Exec(c.Request.Context())
+		if err != nil {
+			httpx.Error(c, err)
+			return
+		}
+		respond(c, gin.H{"activityId": a.ID, "epoch": a.AdmissionEpoch, "state": a.AdmissionState, "revision": a.AdmissionRevision, "quota": a.Quota, "usedQuota": a.UsedQuota, "redis": conf.Val(), "holderEntries": holders.Val(), "pendingEntries": pending.Val()}, nil)
+	})
 	admin.GET("/orders", func(c *gin.Context) { s.listOrders(c, true) })
+	admin.PATCH("/activities/:id", func(c *gin.Context) {
+		var input struct {
+			Title string `json:"title" binding:"required,max=128"`
+		}
+		if c.ShouldBindJSON(&input) != nil {
+			httpx.Error(c, status.Error(codes.InvalidArgument, "展示标题不合法"))
+			return
+		}
+		a, err := s.updateTitle(c.Request.Context(), c.Param("id"), input.Title)
+		respond(c, a, err)
+	})
+	admin.POST("/activities/:id/rebuild-admission", func(c *gin.Context) {
+		a, err := s.scheduleRebuild(c.Request.Context(), c.Param("id"))
+		if err == nil {
+			err = s.buildAdmission(c.Request.Context(), a.ID, a.AdmissionEpoch)
+		}
+		respond(c, gin.H{"activityId": a.ID, "epoch": a.AdmissionEpoch}, err)
+	})
+	admin.DELETE("/activities/:id/cache", func(c *gin.Context) { respond(c, nil, s.invalidate(c.Request.Context(), c.Param("id"))) })
 }
 
 func respond(c *gin.Context, data any, err error) {
@@ -254,6 +293,12 @@ func (s *service) stats(c *gin.Context) {
 		return
 	}
 	var pending, paid, closing, canceled int
+	var oldestRequestAge int64
+	err = s.db.QueryRowContext(c.Request.Context(), "SELECT COALESCE(MAX(TIMESTAMPDIFF(SECOND,created_at,UTC_TIMESTAMP(3))),0) FROM activity_request WHERE activity_id=? AND status IN ('ACCEPTED','PROCESSING')", a.ID).Scan(&oldestRequestAge)
+	if err != nil {
+		httpx.Error(c, err)
+		return
+	}
 	err = s.db.QueryRowContext(c.Request.Context(), `SELECT COALESCE(SUM(status='PENDING_PAYMENT'),0),COALESCE(SUM(status='PAID'),0),
 		COALESCE(SUM(status='CLOSING'),0),COALESCE(SUM(status='CANCELED'),0) FROM orders WHERE activity_id=?`, a.ID).Scan(&pending, &paid, &closing, &canceled)
 	if err != nil {
@@ -261,6 +306,6 @@ func (s *service) stats(c *gin.Context) {
 		return
 	}
 	respond(c, gin.H{"activityId": a.ID, "asOf": time.Now().UTC(), "quota": a.Quota, "usedQuota": a.UsedQuota,
-		"requests": gin.H{"accepted": accepted, "processing": processing, "orderCreated": created, "failed": failed},
+		"requests": gin.H{"accepted": accepted, "processing": processing, "orderCreated": created, "failed": failed, "oldestPendingAgeSeconds": oldestRequestAge},
 		"orders":   gin.H{"pendingPayment": pending, "paid": paid, "closing": closing, "canceled": canceled}}, nil)
 }

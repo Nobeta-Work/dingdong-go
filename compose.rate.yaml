@@ -1,0 +1,10 @@
+# 独立限流实验，不能用于 500 用户 / 200 库存正确性实验。
+services:
+  trade-service:
+    environment:
+      ACTIVITY_RATE_BURST: 3
+      ACTIVITY_RATE_PER_SECOND: 1
+  trade-peer:
+    environment:
+      ACTIVITY_RATE_BURST: 3
+      ACTIVITY_RATE_PER_SECOND: 1

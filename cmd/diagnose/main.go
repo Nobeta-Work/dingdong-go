@@ -199,12 +199,29 @@ func run(r *report) error {
 	if bad > 0 {
 		r.Problems = append(r.Problems, fmt.Sprintf("仍有 %d 条受理未收敛", bad))
 	}
-	err = trade.QueryRowContext(ctx, "SELECT COUNT(*) FROM operation_task WHERE status<>'DONE'").Scan(&bad)
+	// 尚未到期的定时任务不属于积压；NEEDS_REVIEW 始终报告，不能被未来执行时间掩盖。
+	err = trade.QueryRowContext(ctx, "SELECT COUNT(*) FROM operation_task WHERE status='NEEDS_REVIEW' OR (status<>'DONE' AND next_attempt_at<=UTC_TIMESTAMP(3))").Scan(&bad)
 	if err != nil {
 		return err
 	}
 	if bad > 0 {
 		r.Problems = append(r.Problems, fmt.Sprintf("仍有 %d 条恢复任务未完成", bad))
+	}
+	err = trade.QueryRowContext(ctx, "SELECT COUNT(*) FROM event_inbox WHERE status<>'DONE'").Scan(&bad)
+	if err != nil {
+		return err
+	}
+	if bad > 0 {
+		r.Problems = append(r.Problems, fmt.Sprintf("仍有 %d 条 Inbox 消息未完成", bad))
+	}
+	for name, db := range map[string]*sql.DB{"trade": trade, "payment": payment} {
+		err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='NEEDS_REVIEW' OR (status<>'SENT' AND next_attempt_at<=UTC_TIMESTAMP(3))").Scan(&bad)
+		if err != nil {
+			return err
+		}
+		if bad > 0 {
+			r.Problems = append(r.Problems, fmt.Sprintf("%s 仍有 %d 条 Outbox 消息待处理", name, bad))
+		}
 	}
 	err = trade.QueryRowContext(ctx, "SELECT COUNT(*) FROM orders WHERE status='CLOSING' OR (status='PENDING_PAYMENT' AND expires_at<=UTC_TIMESTAMP(3))").Scan(&bad)
 	if err != nil {

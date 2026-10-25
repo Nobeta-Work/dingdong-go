@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/Nobeta-Work/dingdong-go/api/gen/payment/v1"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/event"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/fault"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/httpx"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -16,7 +17,8 @@ import (
 
 type service struct {
 	pb.UnimplementedPaymentServer
-	db *sql.DB
+	db     *sql.DB
+	faults *fault.Engine
 }
 
 func (s *service) CreateOrGet(ctx context.Context, in *pb.CreatePaymentRequest) (*pb.PaymentRecord, error) {
@@ -46,10 +48,16 @@ func (s *service) CreateOrGet(ctx context.Context, in *pb.CreatePaymentRequest) 
 			return nil, status.Error(codes.FailedPrecondition, "支付窗口已结束")
 		}
 	}
-	return p, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return p, s.faults.Hit(ctx, "payment.after_create_commit", in.OrderNo)
 }
 
 func (s *service) QueryByOrder(ctx context.Context, in *pb.OrderRequest) (*pb.PaymentRecord, error) {
+	if err := s.faults.Hit(ctx, "payment.before_query", in.OrderNo); err != nil {
+		return nil, err
+	}
 	p, err := read(ctx, s.db, in.OrderNo, false)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, status.Error(codes.NotFound, "支付单尚不存在")
@@ -85,7 +93,10 @@ func (s *service) CloseByOrder(ctx context.Context, in *pb.OrderRequest) (*pb.Pa
 		p.Status = pb.PaymentStatus_PAYMENT_STATUS_CLOSED
 	}
 	// 已成功返回 SUCCESS，由交易侧转 PAID；未知结果不允许猜测为 CLOSED。
-	return p, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return p, s.faults.Hit(ctx, "payment.after_close_commit", in.OrderNo)
 }
 
 func (s *service) simulate(ctx context.Context, paymentNo, userID, trace string) (*pb.PaymentRecord, error) {

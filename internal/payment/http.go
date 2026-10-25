@@ -15,7 +15,8 @@ import (
 )
 
 func configure(r *app.Runtime) (func(context.Context) error, error) {
-	s := &service{db: r.DB}
+	s := &service{db: r.DB, faults: r.Faults}
+	registerDemo(r, s)
 	pb.RegisterPaymentServer(r.RPC, s)
 	routes := r.Router.Group("/api/payments", auth.Require(r.Config.JWTSecret, false))
 	routes.GET("/:paymentNo", func(c *gin.Context) {
@@ -44,10 +45,11 @@ func configure(r *app.Runtime) (func(context.Context) error, error) {
 		}
 		httpx.Write(c, 200, "OK", "模拟支付成功，未产生真实扣款", view(p))
 	})
-	bus, err := event.Start(r.DB, r.Config.Nameserver, "dingdong-payment", r.Logger, nil)
+	bus, err := event.Start(r.DB, r.Config.Nameserver, "dingdong-payment", r.Logger, nil, event.Options{Workers: r.Config.Workers, MaxAttempts: r.Config.RetryLimit, Metrics: r.Metrics, Faults: r.Faults})
 	if err != nil {
 		return nil, err
 	}
+	bus.Register(r.Router, r.Config.JWTSecret)
 	return bus.Close, nil
 }
 

@@ -18,6 +18,14 @@ x-app: &app
 x-env: &env
   JWT_SECRET: ${JWT_SECRET:?先在 .env 中配置至少 32 字节的 JWT_SECRET}
   PAYMENT_WINDOW: ${PAYMENT_WINDOW:-120s}
+  USER_RATE_BURST: ${USER_RATE_BURST:-3}
+  USER_RATE_PER_SECOND: ${USER_RATE_PER_SECOND:-1}
+  ACTIVITY_RATE_BURST: ${ACTIVITY_RATE_BURST:-500}
+  ACTIVITY_RATE_PER_SECOND: ${ACTIVITY_RATE_PER_SECOND:-100}
+  CACHE_ORIGIN_LIMIT: ${CACHE_ORIGIN_LIMIT:-16}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+  RETRY_LIMIT: ${RETRY_LIMIT:-20}
+  DEMO_FAULTS_ENABLED: ${DEMO_FAULTS_ENABLED:-false}
   HTTP_ADDR: :8080
   RPC_ADDR: :9000
   REDIS_ADDR: redis:6379
@@ -46,7 +54,7 @@ services:
 
   redis:
     image: redis:7.4.2-alpine
-    command: [redis-server, --appendonly, "yes"]
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction]
     ports: ["127.0.0.1:16379:6379"]
     volumes: [redis-data:/data]
     healthcheck:

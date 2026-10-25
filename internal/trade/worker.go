@@ -2,196 +2,235 @@ package trade
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/event"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/httpx"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/work"
+	"github.com/google/uuid"
 )
 
+// handleEvent 先把 MQ 消息转成所属库的任务。重复消息不重置已完成或待人工检查的任务。
 func (s *service) handleEvent(ctx context.Context, e event.Envelope) error {
-	if e.SchemaVersion != 1 {
-		return fmt.Errorf("暂不支持事件版本 %d", e.SchemaVersion)
+	if e.SchemaVersion != 1 || e.EventID == "" || e.AggregateID == "" {
+		return fmt.Errorf("事件字段或版本不合法")
+	}
+	if _, err := uuid.Parse(e.EventID); err != nil || len(e.AggregateID) > 64 {
+		return fmt.Errorf("事件业务键不合法")
 	}
 	switch e.EventType {
-	case "CreateOrderRequested":
-		return s.createOrder(ctx, e.AggregateID, e.TraceID)
-	case "PaymentSucceeded":
-		return s.paymentSucceeded(ctx, e.AggregateID, e.TraceID)
-	case "OrderExpiryDue":
-		return s.closeOrder(ctx, e.AggregateID, e.TraceID)
-	case "InventoryConfirmRequested":
-		return s.settleInventory(ctx, e.AggregateID, true)
-	case "InventoryReleaseRequested":
-		return s.settleInventory(ctx, e.AggregateID, false)
+	case "CreateOrderRequested", "PaymentSucceeded", "OrderExpiryDue", "InventoryConfirmRequested", "InventoryReleaseRequested":
 	default:
 		return fmt.Errorf("未知事件类型 %q", e.EventType)
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = work.PutTask(ctx, tx, e.AggregateID, e.EventType, map[string]string{"orderNo": e.AggregateID}, time.Now(), e.TraceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// recoverLoop 采用游标分页扫描持久化中间态，进程重启无需恢复任何内存订单。
-// M1 的重复扫描通过业务键、行锁和终态幂等收敛；M2 再补充完整任务租约及故障验收。
+func (s *service) handleTask(ctx context.Context, item work.Item) error {
+	ctx = httpx.WithTrace(ctx, item.TraceID)
+	var payload map[string]string
+	if err := json.Unmarshal(item.Payload, &payload); err != nil {
+		return err
+	}
+	switch item.Action {
+	case "CreateOrderRequested":
+		return s.createOrder(ctx, item.Key, item.TraceID)
+	case "PaymentSucceeded":
+		return s.paymentSucceeded(ctx, item.Key, item.TraceID)
+	case "OrderExpiryDue":
+		return s.closeOrder(ctx, item.Key, item.TraceID)
+	case "InventoryConfirmRequested":
+		return s.settleInventory(ctx, item.Key, true)
+	case "InventoryReleaseRequested":
+		return s.settleInventory(ctx, item.Key, false)
+	case "InvalidateActivityCache":
+		return s.invalidate(ctx, payload["activityId"])
+	case "RebuildAdmission":
+		return s.buildAdmission(ctx, payload["activityId"], payload["epoch"])
+	case "AcknowledgeAdmission", "RefundAdmission":
+		r, err := readRequest(ctx, s.db, payload["userId"], payload["requestId"])
+		if err != nil {
+			return err
+		}
+		action := "ACK"
+		if item.Action == "RefundAdmission" {
+			if r.Status != "FAILED" && r.ActivityID == payload["activityId"] {
+				return fmt.Errorf("请求未落失败终态，不允许回补")
+			}
+			action = "REFUND"
+		}
+		return s.resolveAdmission(ctx, payload["activityId"], payload["userId"], payload["requestId"], action)
+	default:
+		return fmt.Errorf("未知任务动作 %q", item.Action)
+	}
+}
+
+// recoverLoop 只分页补齐遗留/到期任务，网络动作由有租约与并发上限的工作队列执行。
 func (s *service) recoverLoop(ctx context.Context, logger *slog.Logger) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	var requestCursor, orderCursor, taskCursor uint64
+	var requestCursor, orderCursor, activityCursor uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		s.scanRequests(ctx, logger, &requestCursor)
-		s.scanOrders(ctx, logger, &orderCursor)
-		s.scanTasks(ctx, logger, &taskCursor)
+		if err := s.scanBusiness(ctx, &requestCursor, &orderCursor); err != nil {
+			logger.Warn("business_scan_retry", "error", err)
+		}
+		if err := s.scanAdmission(ctx, &activityCursor); err != nil {
+			logger.Warn("admission_scan_retry", "error", err)
+		}
 	}
 }
 
-func (s *service) scanRequests(parent context.Context, logger *slog.Logger, cursor *uint64) {
+func (s *service) scanBusiness(parent context.Context, requestCursor, orderCursor *uint64) error {
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,order_no FROM activity_request WHERE id>? AND status IN ('ACCEPTED','PROCESSING')
-		AND updated_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 10 SECOND) ORDER BY id LIMIT 100`, *cursor)
-	if err != nil {
-		cancel()
-		logger.Warn("request_scan_failed", "error", err)
-		return
-	}
+	defer cancel()
 	type entry struct {
-		id uint64
-		no string
+		id         uint64
+		no, action string
 	}
-	batch := make([]entry, 0, 100)
+	batch := make([]entry, 0, 200)
+	rows, err := s.db.QueryContext(ctx, "SELECT id,order_no FROM activity_request WHERE id>? AND status IN ('ACCEPTED','PROCESSING') AND updated_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 10 SECOND) ORDER BY id LIMIT 100", *requestCursor)
+	if err != nil {
+		return err
+	}
+	n := 0
 	for rows.Next() {
 		var e entry
 		if err = rows.Scan(&e.id, &e.no); err != nil {
-			break
+			rows.Close()
+			return err
 		}
+		e.action = "CreateOrderRequested"
 		batch = append(batch, e)
+		*requestCursor = e.id
+		n++
 	}
-	if err == nil {
-		err = rows.Err()
-	}
+	err = rows.Err()
 	rows.Close()
-	cancel()
 	if err != nil {
-		logger.Warn("request_scan_failed", "error", err)
-		return
+		return err
 	}
-	if len(batch) == 0 {
-		*cursor = 0
-		return
+	if n == 0 {
+		*requestCursor = 0
 	}
-	for _, e := range batch {
-		if parent.Err() != nil {
-			return
-		}
-		*cursor = e.id
-		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-		err := s.createOrder(ctx, e.no, "recovery")
-		cancel()
-		if err != nil {
-			logger.Warn("request_recovery_retry", "orderNo", e.no, "error", err)
-		}
-	}
-}
-
-func (s *service) scanOrders(parent context.Context, logger *slog.Logger, cursor *uint64) {
-	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,order_no,status FROM orders WHERE id>? AND
-		((status IN ('PENDING_PAYMENT','CLOSING') AND expires_at<=UTC_TIMESTAMP(3)) OR
-		(status IN ('PAID','CANCELED') AND inventory_status='LOCKED')) ORDER BY id LIMIT 100`, *cursor)
+	rows, err = s.db.QueryContext(ctx, `SELECT id,order_no,status FROM orders WHERE id>? AND
+		((status IN ('PENDING_PAYMENT','CLOSING') AND expires_at<=UTC_TIMESTAMP(3)) OR (status IN ('PAID','CANCELED') AND inventory_status='LOCKED')) ORDER BY id LIMIT 100`, *orderCursor)
 	if err != nil {
-		cancel()
-		logger.Warn("order_scan_failed", "error", err)
-		return
+		return err
 	}
-	type entry struct {
-		id        uint64
-		no, state string
-	}
-	batch := make([]entry, 0, 100)
+	n = 0
 	for rows.Next() {
 		var e entry
-		if err = rows.Scan(&e.id, &e.no, &e.state); err != nil {
-			break
+		var state string
+		if err = rows.Scan(&e.id, &e.no, &state); err != nil {
+			rows.Close()
+			return err
+		}
+		e.action = "OrderExpiryDue"
+		if state == "PAID" {
+			e.action = "InventoryConfirmRequested"
+		}
+		if state == "CANCELED" {
+			e.action = "InventoryReleaseRequested"
 		}
 		batch = append(batch, e)
+		*orderCursor = e.id
+		n++
 	}
-	if err == nil {
-		err = rows.Err()
-	}
+	err = rows.Err()
 	rows.Close()
-	cancel()
 	if err != nil {
-		logger.Warn("order_scan_failed", "error", err)
-		return
+		return err
 	}
-	if len(batch) == 0 {
-		*cursor = 0
-		return
+	if n == 0 {
+		*orderCursor = 0
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, e := range batch {
-		if parent.Err() != nil {
-			return
-		}
-		*cursor = e.id
-		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-		if e.state == "PAID" || e.state == "CANCELED" {
-			err = s.settleInventory(ctx, e.no, e.state == "PAID")
-		} else {
-			err = s.closeOrder(ctx, e.no, "recovery")
-		}
-		cancel()
-		if err != nil {
-			logger.Warn("order_recovery_retry", "orderNo", e.no, "error", err)
+		if err = work.PutTask(ctx, tx, e.no, e.action, map[string]string{"orderNo": e.no}, time.Now(), "recovery"); err != nil {
+			return err
 		}
 	}
+	return tx.Commit()
 }
 
-func (s *service) scanTasks(parent context.Context, logger *slog.Logger, cursor *uint64) {
+func (s *service) scanAdmission(parent context.Context, cursor *uint64) error {
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-	rows, err := s.db.QueryContext(ctx, "SELECT id,business_key FROM operation_task WHERE id>? AND status='PENDING' AND action='RELEASE_BEFORE_ORDER' AND next_attempt_at<=UTC_TIMESTAMP(3) ORDER BY id LIMIT 100", *cursor)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, "SELECT "+activityColumns+" FROM activity WHERE id>? AND status IN ('PUBLISHING','PUBLISHED','PAUSED') ORDER BY id LIMIT 100", *cursor)
 	if err != nil {
-		cancel()
-		logger.Warn("task_scan_failed", "error", err)
-		return
+		return err
 	}
-	type entry struct {
-		id uint64
-		no string
-	}
-	batch := make([]entry, 0, 100)
+	batch := make([]activity, 0, 100)
 	for rows.Next() {
-		var e entry
-		if err = rows.Scan(&e.id, &e.no); err != nil {
-			break
+		a, scanErr := scanActivity(rows)
+		if scanErr != nil {
+			rows.Close()
+			return scanErr
 		}
-		batch = append(batch, e)
+		batch = append(batch, a)
 	}
-	if err == nil {
-		err = rows.Err()
-	}
+	err = rows.Err()
 	rows.Close()
-	cancel()
 	if err != nil {
-		logger.Warn("task_scan_failed", "error", err)
-		return
+		return err
 	}
 	if len(batch) == 0 {
 		*cursor = 0
-		return
+		return nil
 	}
-	for _, e := range batch {
-		if parent.Err() != nil {
-			return
+	for _, a := range batch {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		*cursor = e.id
-		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-		err = s.settleInventory(ctx, e.no, false)
+		var id uint64
+		if _, err = fmt.Sscan(a.ID, &id); err != nil {
+			return err
+		}
+		*cursor = id
+		if a.AdmissionState != "ACTIVE" || !s.metadataReady(ctx, a) {
+			if _, err = s.scheduleRebuild(ctx, a.ID); err != nil {
+				return err
+			}
+			continue
+		}
+		pending, err := pendingScript.Run(ctx, s.redis, admissionKeys(a.ID)).StringSlice()
 		if err != nil {
-			_, _ = s.db.ExecContext(ctx, "UPDATE operation_task SET attempts=attempts+1,next_attempt_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 5 SECOND) WHERE id=? AND status='PENDING'", e.id)
-			logger.Warn("task_recovery_retry", "orderNo", e.no, "error", err)
+			_, rebuildErr := s.scheduleRebuild(ctx, a.ID)
+			if rebuildErr != nil {
+				return rebuildErr
+			}
+			continue
 		}
-		cancel()
+		for _, body := range pending {
+			var t ticket
+			if err = json.Unmarshal([]byte(body), &t); err != nil {
+				return err
+			}
+			if err = s.terminalizeHold(ctx, t); err != nil && err != sql.ErrNoRows {
+				return err
+			}
+		}
 	}
+	return nil
 }

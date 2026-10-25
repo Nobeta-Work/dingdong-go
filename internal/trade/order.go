@@ -9,6 +9,7 @@ import (
 	catalogpb "github.com/Nobeta-Work/dingdong-go/api/gen/catalog/v1"
 	paymentpb "github.com/Nobeta-Work/dingdong-go/api/gen/payment/v1"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/event"
+	"github.com/Nobeta-Work/dingdong-go/internal/platform/work"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -112,11 +113,18 @@ func (s *service) createOrder(ctx context.Context, no, trace string) error {
 	if err != nil {
 		return err
 	}
-	// M1 使用到期时才投递的持久化 Outbox 提醒，另有 5 秒扫描兜底。
+	// 到期事件与兜底任务同时持久化；MQ 正常投递时会提前唤醒本地任务。
 	if err = event.Put(ctx, tx, "OrderExpiryDue", no, map[string]string{"orderNo": no}, expires, trace); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = work.PutTask(ctx, tx, no, "OrderExpiryDue", map[string]string{"orderNo": no}, expires.Add(5*time.Second), trace); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.Add("orders.created", 1)
+	return s.faults.Hit(ctx, "trade.after_order_commit", no)
 }
 
 func (s *service) failRequest(ctx context.Context, r request, reason, trace string) error {
@@ -150,7 +158,7 @@ func (s *service) failRequest(ctx context.Context, r request, reason, trace stri
 		return err
 	}
 	if n == 1 {
-		_, err = tx.ExecContext(ctx, "UPDATE activity SET used_quota=used_quota-1 WHERE id=?", r.ActivityID)
+		_, err = tx.ExecContext(ctx, "UPDATE activity SET used_quota=used_quota-1,admission_revision=admission_revision+1 WHERE id=?", r.ActivityID)
 		if err != nil {
 			return err
 		}
@@ -159,12 +167,17 @@ func (s *service) failRequest(ctx context.Context, r request, reason, trace stri
 	if err = event.Put(ctx, tx, "InventoryReleaseRequested", r.OrderNo, map[string]string{"orderNo": r.OrderNo}, time.Now(), trace); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO operation_task (business_key,action,payload,next_attempt_at)
-		VALUES (?,'RELEASE_BEFORE_ORDER',JSON_OBJECT('orderNo',?),UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE business_key=business_key`, r.OrderNo, r.OrderNo)
-	if err != nil {
+	if err = work.PutTask(ctx, tx, r.OrderNo, "InventoryReleaseRequested", map[string]string{"orderNo": r.OrderNo}, time.Now().Add(5*time.Second), trace); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = work.PutTask(ctx, tx, r.OrderNo, "RefundAdmission", map[string]string{"activityId": r.ActivityID, "userId": r.UserID, "requestId": r.ID}, time.Now(), trace); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.Add("requests.failed", 1)
+	return nil
 }
 
 func (s *service) createPayment(ctx context.Context, no, userID string) (*paymentpb.PaymentRecord, error) {
@@ -292,6 +305,9 @@ func (s *service) finishOrder(ctx context.Context, no string, paid bool, trace s
 	if err = event.Put(ctx, tx, kind, no, map[string]string{"orderNo": no}, time.Now(), trace); err != nil {
 		return err
 	}
+	if err = work.PutTask(ctx, tx, no, kind, map[string]string{"orderNo": no}, time.Now().Add(5*time.Second), trace); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -314,8 +330,7 @@ func (s *service) settleInventory(ctx context.Context, no string, confirm bool) 
 		if err != nil {
 			return err
 		}
-		_, err = s.db.ExecContext(ctx, "UPDATE operation_task SET status='DONE' WHERE business_key=? AND action='RELEASE_BEFORE_ORDER'", no)
-		return err
+		return nil
 	}
 	if err != nil {
 		return err

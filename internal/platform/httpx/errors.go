@@ -41,6 +41,8 @@ func Error(c *gin.Context, err error) {
 		httpStatus, code = 409, "CONFLICT"
 	case codes.Unauthenticated:
 		httpStatus, code = 401, "UNAUTHORIZED"
+	case codes.ResourceExhausted:
+		httpStatus, code = 429, "RATE_LIMITED"
 	}
 	message := s.Message()
 	if httpStatus == 503 {

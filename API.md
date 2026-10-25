@@ -1,4 +1,4 @@
-# M1 接口与状态契约
+# M1 / M2 接口与状态契约
 
 本文描述已实现的接口，不代表完成运行验收。默认 user/catalog/trade/payment HTTP 端口为 18080/18081/18082/18083。
 
@@ -17,10 +17,11 @@
 | 404 | NOT_FOUND | 对象或接口不存在；请求查询按当前用户过滤 |
 | 405 | METHOD_NOT_ALLOWED | 不支持的方法 |
 | 409 | CONFLICT | 请求参数冲突、资格已占用、额度耗尽、状态不允许等 |
+| 429 | RATE_LIMITED | USER_RATE_LIMITED 或 ACTIVITY_RATE_LIMITED；不代表额度或库存不足 |
 | 503 | DEPENDENCY_UNAVAILABLE/NOT_READY | 依赖失败、未知结果、退出中 |
 | 500 | INTERNAL_ERROR | HTTP 未预期 panic |
 
-M1 未实现令牌桶，不产生业务限流 429。技术错误不会直接把未知结果写成 FAILED。业务受理终态和 failureReason 持久化保留。
+持久化请求重放在限流前返回。新请求分别扣用户桶、活动桶；第二桶拒绝不退第一桶令牌。Redis 不可用返回 503。写入结果未知时按业务键回查，不直接写成 FAILED；代次失效等明确拒绝持久化为失败，预扣回补在失败提交之后执行。
 
 ## 用户与商品
 
@@ -31,7 +32,7 @@ M1 未实现令牌桶，不产生业务限流 429。技术错误不会直接把�
 | catalog | GET /api/skus/{id} | 公开，返回 skuId/name/priceCent/available（商品启用状态） |
 | catalog | GET /api/admin/skus/{id}/inventory | 运营，返回 skuId/total/available/locked/sold |
 
-JWT 使用 HS256，issuer=dingdong，有效期两小时；角色为 USER 或 OPERATOR，密码由 seed 以 bcrypt 存储。库存变更仅经内部 RPC。
+JWT 使用 HS256，issuer=dingdong，有效期两小时；角色为 USER 或 OPERATOR，密码由 seed 以 bcrypt 存储。常规库存变更经内部 RPC，演示开关下另有运营鉴权入口复用同一业务方法。
 
 ## 交易服务
 
@@ -104,7 +105,34 @@ RPC 明确区分 InvalidArgument、NotFound、FailedPrecondition、ResourceExhau
 
 真实 MQ Topic 为 dingdong-events，类型包含 CreateOrderRequested、PaymentSucceeded、InventoryConfirmRequested、InventoryReleaseRequested、OrderExpiryDue。信封包含 eventId/eventType/aggregateId/occurredAt/schemaVersion/payload/traceId。
 
-M1 到期提醒由 Outbox 持久化排期投递，每五秒分页扫描作为兜底；受理超过十秒未完成可恢复处理。扫描与轮询间隔不改变 expiresAt。
+到期提醒由 Outbox 持久化排期投递，每五秒分页扫描作为兜底；受理超过十秒未完成可恢复处理。扫描与轮询间隔不改变 expiresAt。队列达到阈值转 NEEDS_REVIEW，需要运营修复原因并显式恢复，不会被重复消息自动重置。
+
+## M2 运营与演示入口
+
+以下路径均要求 OPERATOR 令牌。详细字段、恢复步骤与脚本见 [M2.md](M2.md)。
+
+| 服务 | 方法与路径 | 行为 |
+| --- | --- | --- |
+| 各服务 | GET /api/admin/diagnostics | 当前实例、bootId、配置与进程内计数/延迟；重启后计数清零 |
+| trade | PATCH /api/admin/activities/{id} | body: title；仅修改展示标题，提交后失效缓存并可靠重试 |
+| trade | DELETE /api/admin/activities/{id}/cache | 手工失效详情缓存 |
+| trade | GET /api/admin/activities/{id}/admission | SQL 代次/修订/额度与 Redis 元数据，索引数包含一个哨兵 |
+| trade | POST /api/admin/activities/{id}/rebuild-admission | 先推进 SQL 代次并暂停准入，再重建；503 时持久化任务继续 |
+| trade/payment | GET /api/admin/reliability/{queue} | 分页、可按 status/key 过滤；返回 payload、attempts、lastError 等 |
+| trade/payment | GET /api/admin/reliability/{queue}/stats | 按状态计数、已到期积压与最老等待秒数 |
+| trade/payment | POST /api/admin/reliability/{queue}/{id}/retry | 仅 NEEDS_REVIEW→PENDING，重置尝试次数，恢复失败返回 409 |
+| 各服务 | GET/POST /api/admin/faults | 仅 Demo 开关开启；查看/设置规则，data.rules 为数组 |
+| 各服务 | DELETE /api/admin/faults/{point}?key=… | 仅 Demo 开关开启；清理对应实例的规则 |
+| trade/payment | POST /api/admin/reliability/outbox/{id}/replay | 仅 Demo 开关开启；真实重投已 SENT 事件，保持 eventId |
+| catalog | POST /api/admin/demo/skus | 仅 Demo；body: name、stock（1～10000），新建独立 SKU/库存，返回 201 |
+| catalog | POST /api/admin/demo/inventory/{action} | 仅 Demo；reserve/release/confirm/query，body: orderNo、skuId，固定数量 1 |
+| payment | POST /api/admin/demo/payments/{action} | 仅 Demo；create/close/query，body: orderNo；create 另传 userId、amountCent、expiresAtUnixMilli |
+
+交易队列：outbox、event_inbox、operation_task；支付队列：outbox。key 分别对应 aggregate_id、event_id、business_key。Inbox 的 deliveries 记录真实到达次数，重复消息不会重置 DONE。
+
+故障规则 body：`{"point":"catalog.before_confirm","key":"订单号","action":"fail","remaining":3,"delayMs":0}`。action 支持 fail、delay、crash，key 省略表示该位置所有业务键；remaining 为 1～1000，delayMs 为 0～60000，expiresAt 可选，默认一分钟、最多五分钟。规则仅在当前进程有效；crash 会让进程以 86 退出。
+
+生产/普通演示默认 `DEMO_FAULTS_ENABLED=false`，故障与 demo 路径不开放。完整故障点列表见 M2.md；不接受未知位置或任意代码/SQL。
 
 ## 前端兼容
 

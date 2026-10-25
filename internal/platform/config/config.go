@@ -24,6 +24,14 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	JWTSecret       string
 	PaymentWindow   time.Duration
+	UserBurst       int
+	UserRate        int
+	ActivityBurst   int
+	ActivityRate    int
+	CacheOrigins    int
+	Workers         int
+	RetryLimit      int
+	DemoFaults      bool
 }
 
 // Load 在监听端口前校验必需配置，避免服务带着无效配置对外就绪。
@@ -52,6 +60,25 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("PAYMENT_WINDOW 必须为 5s~1h 的时长")
 	}
 	c.PaymentWindow = window
+	for _, entry := range []struct {
+		key                string
+		fallback, min, max int
+		target             *int
+	}{
+		{"USER_RATE_BURST", 3, 1, 10000, &c.UserBurst}, {"USER_RATE_PER_SECOND", 1, 1, 10000, &c.UserRate},
+		{"ACTIVITY_RATE_BURST", 500, 1, 100000, &c.ActivityBurst}, {"ACTIVITY_RATE_PER_SECOND", 100, 1, 100000, &c.ActivityRate},
+		{"CACHE_ORIGIN_LIMIT", 16, 1, 100, &c.CacheOrigins}, {"WORKER_CONCURRENCY", 8, 1, 8, &c.Workers}, {"RETRY_LIMIT", 20, 1, 100, &c.RetryLimit},
+	} {
+		n, parseErr := strconv.Atoi(value(entry.key, strconv.Itoa(entry.fallback)))
+		if parseErr != nil || n < entry.min || n > entry.max {
+			return Config{}, fmt.Errorf("%s 必须在 %d~%d 之间", entry.key, entry.min, entry.max)
+		}
+		*entry.target = n
+	}
+	c.DemoFaults, err = strconv.ParseBool(value("DEMO_FAULTS_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("DEMO_FAULTS_ENABLED 必须为 true 或 false")
+	}
 	for _, addr := range []string{c.HTTPAddr, c.RPCAddr, c.RedisAddr, c.Nameserver, c.BrokerAddr} {
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			return Config{}, fmt.Errorf("地址 %q 应为 host:port: %w", addr, err)
