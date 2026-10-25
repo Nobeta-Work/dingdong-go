@@ -62,8 +62,8 @@ MQ 使用 4.x NameServer + Broker，无 Proxy。显式创建 dingdong-events 和
 
 仓库根目录首次复制配置，之后不要覆盖已有 .env：
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cp -n .env.example .env
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps -a
@@ -83,23 +83,23 @@ MySQL 空卷首次创建四库及独立 DML/DDL 账号。迁移容器执行 up�
 
 ## 演示与诊断（本次不执行）
 
-PowerShell 7 脚本调用真实服务：
+Bash 脚本调用真实服务，需要 Bash、curl、jq 1.6+ 和系统基础命令（date、od、tr、sleep）。Linux/macOS 可直接使用 Bash，Windows 使用 Git Bash 或 WSL；所有脚本显式通过 `bash` 调用，无需修改执行权限：
 
-```powershell
-.\scripts\demo.ps1 -Scenario All
-.\scripts\demo.ps1 -Scenario Pay
-.\scripts\demo.ps1 -Scenario Timeout
+```bash
+bash scripts/demo.sh --scenario all
+bash scripts/demo.sh --scenario pay
+bash scripts/demo.sh --scenario timeout
 # 额外覆盖尚无支付单时的关闭标记
-.\scripts\demo.ps1 -Scenario Timeout -WithoutPayment
+bash scripts/demo.sh --scenario timeout --without-payment
 # 可选启动容器并初始化，但仍需引擎已运行
-.\scripts\demo.ps1 -StartStack -Scenario All
+bash scripts/demo.sh --start-stack --scenario all
 
-.\scripts\check.ps1 -WithMQ
+bash scripts/check.sh --with-mq
 # 终态收敛、业务静止后独立核对数据库事实
 docker compose run --rm diagnose
 ```
 
-demo 读取 .env 种子密码，也支持 -Password / DEMO_PASSWORD；URL 支持 API_BASE_URL、USER_BASE_URL、PAYMENT_BASE_URL 或脚本参数。每次创建新活动：user01/SKU1 演示支付，user02/SKU2 演示超时，各额度 1。重复演示会保留新活动并消耗真实库存。
+demo 只读取 .env 的 DEMO_PASSWORD，不执行其中的命令；也支持 `--password` / DEMO_PASSWORD。URL 支持 API_BASE_URL、USER_BASE_URL、PAYMENT_BASE_URL，或 `--api-base-url`、`--user-base-url`、`--payment-base-url`。check 还支持 CATALOG_BASE_URL。脚本参数可用 `--help` 查看，不会访问服务。每次创建新活动：user01/SKU1 演示支付，user02/SKU2 演示超时，各额度 1。重复演示会保留新活动并消耗真实库存。
 
 脚本覆盖鉴权、他人订单/支付访问、重复受理和参数冲突、重复支付单/确认、支付库存确认、到期释放与资格不恢复。超时路径按真实 expiresAt 等待，轮询超时不改变业务状态。diagnose 检查库存非负/守恒/流水、订单与支付/预占终态、订单唯一、资格与额度、未完成受理和任务。跨服务没有全局读快照，须在静止窗口执行。
 
@@ -120,18 +120,20 @@ demo 读取 .env 种子密码，也支持 -Password / DEMO_PASSWORD；URL 支持
 
 ## 本地构建与 IDE
 
-```powershell
+```bash
 go mod download
 go build ./...
 go vet ./...
+# Linux 容器目标交叉编译，只编译不运行服务
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 ```
 
 默认 Broker 公告 rmq-broker，仅供容器网络使用。Docker Desktop IDE 调试需覆盖配置，使宿主机与容器都能访问公告地址：
 
-```powershell
+```bash
 docker compose -f compose.yaml -f compose.debug.yaml up -d
 docker compose stop trade-service
-. .\configs\local.example.ps1
+source configs/local.example.sh
 go run ./cmd/trade
 ```
 
@@ -141,8 +143,10 @@ go run ./cmd/trade
 
 安装 [protoc 29.3](https://github.com/protocolbuffers/protobuf/releases/tag/v29.3)：
 
-```powershell
-.\scripts\generate.ps1 -Protoc 'C:\tools\protoc\bin\protoc.exe'
+```bash
+bash scripts/generate.sh --protoc /path/to/protoc
+# Windows Git Bash 示例，路径按本机安装位置调整
+bash scripts/generate.sh --protoc '/c/tools/protoc/bin/protoc.exe'
 ```
 
 插件固定安装到忽略跟踪的 bin/，输出 api/gen/。本次新增 GetSKU 的 stock_available=5，未修改既有字段编号；删除字段必须 reserved。
