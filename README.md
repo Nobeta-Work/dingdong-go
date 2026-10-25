@@ -2,7 +2,9 @@
 
 限量活动商城后端，一个 Go module、四个独立服务。用户浏览活动、提交抢购、查询订单并模拟支付；未付款订单到期后关闭并释放真实 SKU 库存。
 
-**当前状态：M1、M2 业务代码与验收工具已实现，运行验收未执行。** 按本次要求，不启动 Docker 引擎、不运行服务和数据库联调。编译或配置解析不能替代运行验收。接口见 [API.md](API.md)，M2 设计、操作及验证范围见 [M2.md](M2.md)。M3 尚未实现。
+**当前状态：M1、M2 业务代码与验收工具已实现，运行验收未执行。** 按本次要求，不启动 Docker 引擎、不运行服务和数据库联调。编译或配置解析不能替代运行验收。接口见 [API.md](API.md)，M2 设计、操作及验证范围见 [M2.md](docs/explain/M2.md)。M3 尚未实现。
+
+学习项目可从 [项目阅读指南](docs/explain/README.md) 开始，按框架、M1 业务、gRPC 和 M2 原理逐步阅读。
 
 ## 目录与阅读顺序
 
@@ -158,6 +160,6 @@ bash scripts/generate.sh --protoc '/c/tools/protoc/bin/protoc.exe'
 - 缺少 JWT_SECRET 会在监听前失败；依赖错误可在结构化日志中按 traceId/orderNo/eventId 追踪。
 - Outbox/Inbox/operation_task 达到重试阈值后保留 NEEDS_REVIEW；运营通过 `/api/admin/reliability/{queue}` 查看，修复原因后 `POST /{id}/retry` 恢复。
 
-M2 双实例缓存、并发、独立限流和 40 组故障回归的准备步骤及 Bash 命令见 [M2.md](M2.md)。`scripts/acceptance.sh` 只执行验收客户端，不负责启动任何服务。
+M2 双实例缓存、并发、独立限流和 40 组故障回归的准备步骤及 Bash 命令见 [M2.md](docs/explain/M2.md)。`scripts/acceptance.sh` 只执行验收客户端，不负责启动任何服务。
 
 既有 Vue API/Java 契约在工作区不可得，当前按 PRD 交付接口，前端兼容映射和 CORS 来源待验证。不新增前端，不默认开放任意来源。PRD 沿用本地被忽略的 docs/prd/。

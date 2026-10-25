@@ -109,7 +109,7 @@ RPC 明确区分 InvalidArgument、NotFound、FailedPrecondition、ResourceExhau
 
 ## M2 运营与演示入口
 
-以下路径均要求 OPERATOR 令牌。详细字段、恢复步骤与脚本见 [M2.md](M2.md)。
+以下路径均要求 OPERATOR 令牌。详细字段、恢复步骤与脚本见 [M2.md](docs/explain/M2.md)。
 
 | 服务 | 方法与路径 | 行为 |
 | --- | --- | --- |
