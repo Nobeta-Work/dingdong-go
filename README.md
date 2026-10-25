@@ -1,42 +1,52 @@
 # DingDong Go
 
-限量活动商城后端 Demo。一个 Go module，四个独立进程，业务数据由各服务独立拥有。
+限量活动商城后端，一个 Go module、四个独立服务。用户浏览活动、提交抢购、查询订单并模拟支付；未付款订单到期后关闭并释放真实 SKU 库存。
 
-**当前进度：M1 基础框架。尚未完成 M1 可运行交易闭环。** 没有业务成功桩，也没有前端代码。
+**当前状态：M1 业务代码和交付脚本已补齐，运行验收未执行。** 按本次要求，不启动 Docker 引擎、不运行服务和数据库联调。编译或配置检查不能代替 M1 的运行验收。接口见 [API.md](API.md)，验证记录见 [VALIDATION.md](VALIDATION.md)。
 
 ## 目录与阅读顺序
 
 ```text
-cmd/                       四服务入口、seed、mqcheck、healthcheck 工具
-internal/
-  user/                    用户服务启动，后续实现账号、角色和登录
-  catalog/                 商品服务启动，后续实现 SKU、库存本地事务
-  trade/                   交易服务启动，后续实现活动、受理、订单与编排
-  payment/                 支付服务启动，后续实现模拟支付与支付事件
-  platform/
-    config/                环境变量读取与基础配置校验
-    app/                   连接池、HTTP/gRPC、依赖检查和退出排空
-    httpx/                 Gin、统一响应、请求追踪与结构化日志
-    event/                 MQ 事件信封
-api/proto/                 Catalog、Inventory、Payment 协议源文件
-api/gen/                   通过脚本生成的 Go 协议代码
-migrations/{service}/      各库独立、带版本的增量迁移
-deploy/                    MySQL 首次建库授权、RocketMQ 配置
-configs/                   IDE 调试配置示例
-scripts/                   协议生成、真实框架接口检查
-compose.yaml               四服务和依赖，不含前端或自研网关
+cmd/                       四服务入口、seed、mqcheck、diagnose、healthcheck
+internal/user/             密码登录、JWT 签发、当前用户
+internal/catalog/          SKU 查询、库存预占/确认/释放与流水
+internal/trade/            活动、持久化受理、订单、事件消费与恢复扫描
+internal/payment/          模拟支付、关闭标记、支付成功事件
+internal/platform/         资源生命周期、配置、鉴权、HTTP 协议、事件基础设施
+api/proto/ 与 api/gen/      RPC 协议及已生成代码
+migrations/{service}/      各服务独立的增量迁移
+deploy/                    MySQL 初次建库授权、RocketMQ 配置
+configs/                   IDE 配置示例
+scripts/                   协议生成、框架检查和业务演示
+compose.yaml               默认容器环境
+compose.debug.yaml         Docker Desktop IDE 调试覆盖配置
 ```
 
-推荐先读 `cmd/trade/main.go` → `internal/trade/service.go` → `internal/platform/app/app.go`，理解入口、服务装配和连接生命周期；再读 `httpx`、迁移和 RPC 契约。
+推荐先读 `cmd/trade` → `trade/service.go` → `platform/app` 理解资源生命周期，再按 `trade/http.go` → `request.go` → `order.go` → `worker.go` 理解交易。库存、支付的本地事务分别在 `catalog/inventory.go`、`payment/payment.go`。
 
-HTTP Handler、RPC Handler 和消费者后续放在各自服务包中，共用该服务业务层。当前不为尚未实现的业务创建空的 handler/service/repository 层。公共平台包不能写业务表，禁止服务间跨库 JOIN 或直接修改对方数据。
+HTTP、RPC、MQ 复用各服务内部业务方法；服务只访问自己的库。公共包不承载跨服务业务表写入，也不为尚不存在的复杂度创建空的 repository/interface 层。诊断工具通过独立连接只读比较事实，不执行跨库 SQL。
+
+## M1 的实现方式
+
+1. 用户服务校验 bcrypt 密码并签发两小时 JWT。各 HTTP 服务验证 HS256、issuer、有效期和角色，归属只来自可信身份上下文。
+2. 运营通过商品 RPC 读取 SKU，创建草稿并发布。发布状态为 DRAFT → PUBLISHING → PUBLISHED，可重试且不重置额度，额度不能超过发布时可用库存。
+3. **M1 采用数据库准入**：锁活动行检查状态、时间和额度，同时持有用户资格、保存受理快照、固定订单号及成单 Outbox，事务提交后才返回 202。Redis 故障拒绝新受理，旧请求仍可查询。
+4. Outbox 投递真实 RocketMQ。消费者按固定订单号预占库存，再本地创建订单、商品快照和到期提醒，消耗用户资格。排队跨过活动结束时间不影响合法受理。
+5. 交易服务校验归属与期限后通过 RPC 创建支付单。模拟支付事实和成功事件同事务提交；交易消费后转 PAID，再幂等确认库存。只有 PAID + CONFIRMED 才返回 fulfillable=true。
+6. 到期提醒与每五秒扫描共同驱动关闭。CLOSING 中回查支付，已成功则转已支付；支付明确关闭后才取消并释放库存。未知结果保留中间态，RPC 写入超时按业务键回查。取消订单不恢复活动资格或额度。
+
+库存释放先到时写 RELEASED 标记；支付关闭先到时写 CLOSED 标记，防止迟到创建覆盖终态。金额使用分，所有服务按 UTC 存储/读取时间，业务 ID 以字符串输出。
+
+为满足 M1 的持久化受理和重启恢复，提前实现最小 Outbox：事务入库、短事务领取、事务外发送、租约过期重投及幂等消费。到期事件在数据库中排期，到期才投递，尚未接入 Broker 原生延时消息。扫描分页恢复未完成受理、到期订单、库存动作及成单前释放任务。
+
+M2 仍需缓存/singleflight、Redis Lua 令牌桶和准入栅栏、完整有限退避与 NEEDS_REVIEW 管理、任务领取强化及故障/并发验收；M1 不宣称已通过多副本故障验证。M3 K8s/Traefik 仍未实现。
 
 ## 固定版本
 
-| 组件 | 版本与选择 |
+| 组件 | 版本 |
 | --- | --- |
-| Go | 1.27.1，与已有 go.mod 一致；镜像 golang:1.27.1-bookworm |
-| Gin | v1.10.0 |
+| Go / 构建镜像 | 1.27.1 / golang:1.27.1-bookworm |
+| Gin / JWT | v1.10.0 / golang-jwt/jwt/v5 v5.2.1 |
 | grpc-go / Protobuf Go | v1.70.0 / v1.36.5 |
 | protoc / Go gRPC 生成器 | 29.3 / v1.5.1 |
 | MySQL 驱动 / 服务端 | v1.9.0 / mysql:8.4.4 |
@@ -44,72 +54,71 @@ HTTP Handler、RPC Handler 和消费者后续放在各自服务包中，共用�
 | RocketMQ / Go SDK | apache/rocketmq:4.9.8 / rocketmq-client-go/v2 v2.1.2 |
 | 迁移工具 | migrate/migrate:v4.18.2 |
 
-采用 RocketMQ 4.x NameServer + Broker 及经典 Go v2 客户端，不需要 Proxy。重投检查使用 Broker 延时级别 1（1 秒），没有使用 5.x 任意时间戳延时接口。业务延时事件和扫描任务尚未实现。依据：[官方 Compose 说明](https://rocketmq.apache.org/docs/4.x/quickstart/03quickstartWithDockercompose/)、[固定 SDK 重投示例](https://github.com/apache/rocketmq-client-go/blob/v2.1.2/examples/consumer/retry/concurrent/main.go)。版本组合仍需在本机 Docker 环境实测。
+MQ 使用 4.x NameServer + Broker，无 Proxy。显式创建 dingdong-events 和 dingdong-framework-check Topic。检查工具主动拒绝首次消费，再检查 Broker 重投，参考 [固定 SDK 官方示例](https://github.com/apache/rocketmq-client-go/blob/v2.1.2/examples/consumer/retry/concurrent/main.go)。镜像与版本组合尚未运行验证。
 
-## 启动基础框架
+## 启动与初始化（供后续手动执行）
 
-需要 Docker Desktop 的 Linux 容器引擎与 Compose v2。建议预留 4 CPU、6 GB 内存；这是启动预算建议，尚无实际容器资源测量结果。
+需要已运行的 Docker Linux 引擎和 Compose v2，脚本不启动 Docker Desktop。建议预留 4 CPU、6 GB 内存，仅为预算建议，未实测资源用量。
 
-以下 PowerShell 命令在仓库根目录执行：
+仓库根目录首次复制配置，之后不要覆盖已有 .env：
 
 ```powershell
 Copy-Item .env.example .env
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps -a
-```
-
-复制配置只需首次执行。若默认 Go 代理不可达，在 `.env` 将 `GOPROXY` 改为 `https://goproxy.cn,direct` 后构建。Docker 镜像下载使用 Docker 自身的镜像源设置。
-
-MySQL 空数据卷首次执行 `deploy/mysql/init/00-databases.sql`，创建四个逻辑库、四个仅有所属库 DML 权限的应用账号和四个库级迁移账号。随后每个迁移容器执行 `up`，服务等待所属库迁移成功再启动。增量变更应新增迁移文件，不修改已经执行的版本。
-
-Demo 数据库账号密码见 Compose 和建库 SQL，仅用于本地开发。应用不使用 root。`.env` 的 root 密码只在首次创建 MySQL 卷时生效，修改文件不会自动修改已有库密码。MySQL 初始化脚本修改后也不会自动作用于旧卷。
-
-```powershell
 docker compose run --rm seed-user
 docker compose run --rm seed-catalog
-.\scripts\check.ps1 -WithMQ
 ```
 
-种子账号为 `user01`、`user02`、`operator` 和 `bench0001`～`bench0500`，共 503 个；初始密码来自 `.env` 的 `DEMO_PASSWORD`，bcrypt 哈希存储。目录内的账号只用于后续业务实现，**当前没有登录接口**。商品种子为两个独立 SKU，每个初始库存 200，金额 1990 分。重复初始化不覆盖密码、角色、商品或库存。尚未种子初始化活动，避免绕过未来的发布流程与 SKU RPC 校验。
+`.env` 必须有 MYSQL_ROOT_PASSWORD、至少 32 字节的 JWT_SECRET 和种子账号 DEMO_PASSWORD。PAYMENT_WINDOW 默认 120s，允许 5s～1h，可设 30s 缩短演示；配置变化不修改已有订单 expiresAt。四服务 JWT 密钥必须相同，示例凭据只用于本地 Demo。旧 .env 需手动补入本次新增字段。
 
-`check.ps1` 检查真实 `/livez`、`/readyz` 及 traceId；`-WithMQ` 再调用真实 SDK 发送消息，首次消费主动返回重试，只有收到 `ReconsumeTimes > 0` 的 Broker 重投才通过。成功日志为 `mq_check_passed`。这只验证基础设施，不是 PRD A01～A06 业务验收。
+默认 Go 代理不可达时，将 GOPROXY 改为 `https://goproxy.cn,direct`，不会修改全局设置；Docker 下载使用其自身网络配置。
+
+MySQL 空卷首次创建四库及独立 DML/DDL 账号。迁移容器执行 up，服务等待所属库迁移成功；新增 `trade/000003_admission.up.sql` 在既有结构上增加额度计数。不要修改已执行迁移。旧卷不会重新执行建库脚本，修改 .env 不会自动更改旧库密码。
+
+种子为 user01、user02、operator、bench0001～bench0500，共 503 个账号，密码取初始化时的 DEMO_PASSWORD 并哈希存储。两个 SKU 各 200 件、1990 分。重复初始化不覆盖账号、商品或库存；活动由演示脚本通过运营接口创建，不绕过发布 RPC 校验。
+
+正常停止使用 `docker compose down`，保留业务数据。**`docker compose down -v` 会删除全部项目数据卷，不属于正常启动或恢复步骤。** 启动、种子和演示脚本均不清空数据、不重置库存或额度。
+
+## 演示与诊断（本次不执行）
+
+PowerShell 7 脚本调用真实服务：
 
 ```powershell
-# Linux/macOS 也可直接检查与运行工具，不依赖 PowerShell。
-curl --fail http://localhost:18082/readyz
-docker compose run --rm mqcheck
+.\scripts\demo.ps1 -Scenario All
+.\scripts\demo.ps1 -Scenario Pay
+.\scripts\demo.ps1 -Scenario Timeout
+# 额外覆盖尚无支付单时的关闭标记
+.\scripts\demo.ps1 -Scenario Timeout -WithoutPayment
+# 可选启动容器并初始化，但仍需引擎已运行
+.\scripts\demo.ps1 -StartStack -Scenario All
+
+.\scripts\check.ps1 -WithMQ
+# 终态收敛、业务静止后独立核对数据库事实
+docker compose run --rm diagnose
 ```
 
-正常停止使用 `docker compose down`，**保留所有数据卷**。本项目的启动和初始化命令不删除数据，也不重置活动额度。只有显式执行 `docker compose down -v` 才会删除本项目数据卷和其中全部数据；该命令不属于正常启动步骤。
+demo 读取 .env 种子密码，也支持 -Password / DEMO_PASSWORD；URL 支持 API_BASE_URL、USER_BASE_URL、PAYMENT_BASE_URL 或脚本参数。每次创建新活动：user01/SKU1 演示支付，user02/SKU2 演示超时，各额度 1。重复演示会保留新活动并消耗真实库存。
 
-## 端口与健康检查
+脚本覆盖鉴权、他人订单/支付访问、重复受理和参数冲突、重复支付单/确认、支付库存确认、到期释放与资格不恢复。超时路径按真实 expiresAt 等待，轮询超时不改变业务状态。diagnose 检查库存非负/守恒/流水、订单与支付/预占终态、订单唯一、资格与额度、未完成受理和任务。跨服务没有全局读快照，须在静止窗口执行。
+
+## 地址与健康检查
 
 | 服务 | HTTP | RPC / 依赖端口 |
 | --- | --- | --- |
-| user-service | localhost:18080 | 无业务 RPC |
+| user-service | localhost:18080 | — |
 | catalog-service | localhost:18081 | localhost:19000 |
-| trade-service | localhost:18082 | 调用 catalog/payment |
+| trade-service | localhost:18082 | 调用库存、支付 |
 | payment-service | localhost:18083 | localhost:19001 |
-| MySQL | — | localhost:13306 |
-| Redis | — | localhost:16379 |
-| RocketMQ | — | localhost:19876（NameServer）、10911（Broker 探测） |
+| MySQL / Redis | — | localhost:13306 / 16379 |
+| RocketMQ | — | localhost:19876（NameServer）、10911（Broker） |
 
-所有宿主机映射只绑定 `127.0.0.1`。RPC 在容器中使用服务 DNS，不写死 IP；RPC 仅用于内部调用，当前无 TLS/鉴权，不应公开到互联网。
+映射只绑定宿主机回环地址，RPC 不应公开外网。容器之间使用服务 DNS；ClientConn 长期复用并使用 round_robin，业务 RPC 截止 1 秒。
 
-`GET /livez` 只判断进程响应；`GET /readyz` 检查当前服务使用的依赖，失败返回 503，避免把依赖故障当作进程死亡。数据库检查执行 Ping，Redis 执行 PING，交易服务调用库存和支付的标准 gRPC Health Check。MQ 这里只探测 NameServer/Broker TCP 连通性，不验证 Topic 或消费进度；通过 mqcheck 单独验证消息能力。
+/livez 只判断 HTTP 进程；/readyz 检查所属库和使用中的依赖，失败返回 503。MQ TCP 探针不代表消费进度健康。Catalog/Payment 的 gRPC Health 表示 RPC 监听已启动，实际依赖以其 HTTP /readyz 为准。退出时撤销就绪，停止后台领取并排空 HTTP/gRPC，共用 15 秒预算，Compose 宽限 20 秒；退出重投仍待运行验收。
 
-Catalog/Payment 的 gRPC 健康服务当前表示 RPC 进程已经启动，依赖状态以其 HTTP `/readyz` 为准。业务 RPC 契约已定义，但没有注册业务处理器，调用返回 gRPC `Unimplemented`。参考：[标准 gRPC 健康协议](https://grpc.io/docs/guides/health-checking/)。
-
-统一 HTTP 响应：
-
-```json
-{"code":"OK","message":"基础设施就绪","data":{"service":"trade-service","stage":"M1_FRAMEWORK"},"traceId":"..."}
-```
-
-当前错误码：`NOT_FOUND`（404）、`METHOD_NOT_ALLOWED`（405）、`DEPENDENCY_UNAVAILABLE`/`NOT_READY`（503）、`INTERNAL_ERROR`（500）。后续业务错误码按 PRD 在实际接口中加入，不将未实现功能返回为成功。
-
-## 本地 Go 与 IDE 调试
+## 本地构建与 IDE
 
 ```powershell
 go mod download
@@ -117,60 +126,31 @@ go build ./...
 go vet ./...
 ```
 
-无需单独测试模块。框架验证使用编译、静态检查、真实 HTTP 和 MQ 工具。
-
-例如调试交易服务：先按上文启动全部容器，再停止其容器以腾出端口，保持上下游运行：
+默认 Broker 公告 rmq-broker，仅供容器网络使用。Docker Desktop IDE 调试需覆盖配置，使宿主机与容器都能访问公告地址：
 
 ```powershell
+docker compose -f compose.yaml -f compose.debug.yaml up -d
 docker compose stop trade-service
 . .\configs\local.example.ps1
 go run ./cmd/trade
 ```
 
-其他服务修改 `MYSQL_DSN` 为各自账号与库，设置不同的 `HTTP_ADDR`；catalog/payment 还需分别设置 `RPC_ADDR=:19000`/`:19001`，并停止对应容器。不要让应用账号访问其他服务库。
+覆盖配置公告 host.docker.internal，本机与容器都必须能解析该名称，此配置尚未实测。其他环境需提供两边可访问的宿主机 DNS 和映射端口，不能只改 NameServer 或写死实例 IP。调试其他服务时改用所属库账号、不同 HTTP 端口，catalog/payment 分别设置 RPC_ADDR=:19000/:19001 并停止对应容器。
 
-Broker 公布容器 DNS `rmq-broker`，宿主机不能直接使用该地址完成 MQ 业务通信。框架阶段宿主机仅做 Broker TCP 检查；真实消息工具通过 `docker compose run --rm mqcheck` 在网络内部运行。后续 IDE 调试 MQ 消费者需配置宿主机和容器都可解析、访问的 Broker 公告地址，不能只映射 NameServer 端口。
+## 协议生成与排障
 
-## Protobuf 生成
-
-安装 [protoc 29.3](https://github.com/protocolbuffers/protobuf/releases/tag/v29.3)，执行：
+安装 [protoc 29.3](https://github.com/protocolbuffers/protobuf/releases/tag/v29.3)：
 
 ```powershell
 .\scripts\generate.ps1 -Protoc 'C:\tools\protoc\bin\protoc.exe'
 ```
 
-脚本将固定版本的两个 Go 插件安装到忽略跟踪的 `bin/`，输出 `api/gen/`。生成文件提交版本控制，普通构建无需 protoc。已有字段编号不得变更；删除字段使用 `reserved`。
+插件固定安装到忽略跟踪的 bin/，输出 api/gen/。本次新增 GetSKU 的 stock_available=5，未修改既有字段编号；删除字段必须 reserved。
 
-## 排障
+- 引擎未运行时启动命令会失败，何时启动由使用者决定，本次不代为操作。
+- 迁移失败看 migrate-* 日志；MySQL DDL 不保证整份文件回滚，不盲目 force 或删卷。
+- MQ 故障看 mq-init、Broker、NameServer 日志，检查 Topic 和公告 DNS。
+- 缺少 JWT_SECRET 会在监听前失败；依赖错误可在结构化日志中按 traceId/orderNo/eventId 追踪。
+- 最小 Outbox 持续保留重试记录；完整有限退避、死信/NEEDS_REVIEW 查看恢复属于 M2。
 
-- Docker 提示找不到 Linux Engine 管道：启动 Docker Desktop 并确认 Linux 引擎可用。
-- `docker compose ps -a` 出现迁移非零退出：查看 `docker compose logs migrate-trade`（或对应服务），先修复迁移。不要对未知失败盲目执行 `force`，MySQL DDL 不能保证整份文件回滚。
-- 服务反复重启：查看 `docker compose logs trade-service`，启动错误会列出失败依赖名称，不输出 DSN 凭据。依赖调用有超时，服务不会无限等待。
-- MQ 初始化失败：查看 `docker compose logs mq-init rmq-broker rmq-nameserver`，确认 Broker 内存和服务 DNS；修复后执行 `docker compose up -d mq-init trade-service payment-service`。
-- MQ 重投检查超时：确认 Topic 已创建、Broker 公告地址可达；检查工具必须在 Compose 网络运行。每次检查会产生独立临时消费组和消息，只适合 Demo 验证。
-- SIGTERM 退出：先撤销就绪状态，再排空 HTTP/gRPC，预算 15 秒，Compose 宽限期 20 秒；尚未运行业务消费者，不宣称已验证消息排空。
-
-## 阶段进度与验证记录
-
-2026-10-24，Windows，本机 Go 1.27.1 windows/386、Docker CLI 29.5.2；Docker Linux 引擎未启动。
-
-已实际通过：
-
-- `go build ./...`：本机 Windows 编译。
-- `go vet ./...`：静态检查。
-- `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...`：Linux 容器目标交叉编译（PowerShell 使用 `$env:` 设置变量）。
-- protoc 29.3 + 固定 Go 插件生成 `api/gen/`，生成代码参与上述编译。
-- `docker compose --env-file .env.example config --quiet`：Compose 配置解析与依赖关系校验。
-- PowerShell Parser 检查全部配置与脚本语法；`gofmt` 与 `git diff --check` 检查通过。
-
-未执行：镜像构建和拉取、容器启动、迁移 SQL 的真实执行、种子重复初始化、HTTP 运行检查、MQ 生产/消费/重投及退出排空。这些检查需要可用的 Docker Linux 引擎；不能用交叉编译或 Compose 配置通过代替运行结论。
-
-| 阶段 | 已实现 | 未完成 |
-| --- | --- | --- |
-| M1 框架 | 四入口、Gin、配置、日志、统一响应、健康检查、独立库账号、数据库结构与迁移、种子工具、gRPC 健康通信及业务协议、Compose、MQ 检查工具 | 容器运行验证；JWT 登录、活动管理/查询、受理、真实库存 RPC、异步成单、模拟支付、超时关单、业务演示与不变量脚本 |
-| M2 | 仅预留 Outbox、任务表及事件信封 | 缓存、singleflight、Lua 限流/额度、Outbox 投递和任务领取、补偿、故障注入与并发验收 |
-| M3 | 仅基础退出生命周期可复用 | K8s/Traefik 清单、双副本、探针和资源实测、滚动更新验收 |
-
-PRD 在本地 `docs/prd/`，该目录沿用仓库原有忽略规则。未找到既有 Vue 的 API 封装或 Java 契约，接口兼容映射、CORS 来源和前端联调均待验证，不默认放开任意来源。
-
-后续按纵向业务实现：登录 → SKU/库存 RPC → 活动与持久化受理 → MQ 成单 → 支付成功及库存确认 → 到期关闭及释放。M1 应保留真实数据库与消息链路；M2 再补齐完整故障恢复和并发保护，不能用内存订单或固定成功库存接口替代。
+既有 Vue API/Java 契约在工作区不可得，当前按 PRD 交付接口，前端兼容映射和 CORS 来源待验证。不新增前端，不默认开放任意来源。PRD 沿用本地被忽略的 docs/prd/。

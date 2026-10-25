@@ -6,6 +6,7 @@ require (
 	github.com/apache/rocketmq-client-go/v2 v2.1.2
 	github.com/gin-gonic/gin v1.10.0
 	github.com/go-sql-driver/mysql v1.9.0
+	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.7.3
 	golang.org/x/crypto v0.30.0

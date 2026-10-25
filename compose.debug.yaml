@@ -1,0 +1,5 @@
+# 仅用于 Docker Desktop 下的 IDE 调试，需要宿主机与容器都能解析 host.docker.internal。
+services:
+  rmq-broker:
+    volumes:
+      - ./deploy/rocketmq/broker.debug.conf:/home/rocketmq/broker.conf:ro

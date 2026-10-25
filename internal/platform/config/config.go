@@ -22,6 +22,8 @@ type Config struct {
 	CatalogTarget   string
 	PaymentTarget   string
 	ShutdownTimeout time.Duration
+	JWTSecret       string
+	PaymentWindow   time.Duration
 }
 
 // Load 在监听端口前校验必需配置，避免服务带着无效配置对外就绪。
@@ -37,16 +39,24 @@ func Load() (Config, error) {
 		CatalogTarget:   value("CATALOG_RPC_TARGET", "dns:///localhost:19000"),
 		PaymentTarget:   value("PAYMENT_RPC_TARGET", "dns:///localhost:19001"),
 		ShutdownTimeout: 15 * time.Second,
+		JWTSecret:       os.Getenv("JWT_SECRET"),
 	}
 	if c.MySQLDSN == "" {
 		return Config{}, fmt.Errorf("缺少 MYSQL_DSN，请使用当前服务独立的数据库账号")
 	}
+	if len(c.JWTSecret) < 32 {
+		return Config{}, fmt.Errorf("JWT_SECRET 至少需要 32 字节")
+	}
+	window, err := time.ParseDuration(value("PAYMENT_WINDOW", "120s"))
+	if err != nil || window < 5*time.Second || window > time.Hour {
+		return Config{}, fmt.Errorf("PAYMENT_WINDOW 必须为 5s~1h 的时长")
+	}
+	c.PaymentWindow = window
 	for _, addr := range []string{c.HTTPAddr, c.RPCAddr, c.RedisAddr, c.Nameserver, c.BrokerAddr} {
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			return Config{}, fmt.Errorf("地址 %q 应为 host:port: %w", addr, err)
 		}
 	}
-	var err error
 	c.RedisDB, err = strconv.Atoi(value("REDIS_DB", "0"))
 	if err != nil || c.RedisDB < 0 {
 		return Config{}, fmt.Errorf("REDIS_DB 必须是非负整数")

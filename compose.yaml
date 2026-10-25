@@ -16,6 +16,8 @@ x-app: &app
     start_period: 20s
 
 x-env: &env
+  JWT_SECRET: ${JWT_SECRET:?先在 .env 中配置至少 32 字节的 JWT_SECRET}
+  PAYMENT_WINDOW: ${PAYMENT_WINDOW:-120s}
   HTTP_ADDR: :8080
   RPC_ADDR: :9000
   REDIS_ADDR: redis:6379
@@ -90,6 +92,7 @@ services:
           if [ "$$i" -ge 30 ]; then echo 'RocketMQ topic initialization failed' >&2; exit 1; fi
           sleep 3
         done
+        sh mqadmin updateTopic -n rmq-nameserver:9876 -b rmq-broker:10911 -t dingdong-events -r 4 -w 4
 
   migrate-user:
     image: migrate/migrate:v4.18.2
@@ -190,6 +193,17 @@ services:
       ROCKETMQ_NAMESERVER: rmq-nameserver:9876
     depends_on:
       mq-init: {condition: service_completed_successfully}
+
+  diagnose:
+    image: dingdong-go:dev
+    profiles: [tools]
+    command: [/app/diagnose]
+    environment:
+      DIAG_TRADE_DSN: dingdong_trade:demo-trade@tcp(mysql:3306)/dingdong_trade
+      DIAG_CATALOG_DSN: dingdong_catalog:demo-catalog@tcp(mysql:3306)/dingdong_catalog
+      DIAG_PAYMENT_DSN: dingdong_payment:demo-payment@tcp(mysql:3306)/dingdong_payment
+    depends_on:
+      trade-service: {condition: service_healthy}
 
 volumes:
   mysql-data:

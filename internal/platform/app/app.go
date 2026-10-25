@@ -20,9 +20,11 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin" // 注册 DNS 多地址的轮询策略。
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/config"
 	"github.com/Nobeta-Work/dingdong-go/internal/platform/httpx"
@@ -35,6 +37,19 @@ type Spec struct {
 	MQ           bool
 	RPC          bool
 	TradeClients bool
+	Configure    func(*Runtime) (func(context.Context) error, error)
+}
+
+// Runtime 把当前服务所属的资源交给其装配函数；不暴露其他服务数据库。
+type Runtime struct {
+	Config      config.Config
+	DB          *sql.DB
+	Router      *gin.Engine
+	RPC         *grpc.Server
+	CatalogConn *grpc.ClientConn
+	PaymentConn *grpc.ClientConn
+	Logger      *slog.Logger
+	Redis       *redis.Client
 }
 
 // Run 装配依赖、启动监听并在退出信号到来时排空在途请求。
@@ -44,6 +59,7 @@ func Run(spec Spec) error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", spec.Name, "instance", os.Getenv("HOSTNAME"))
+	slog.SetDefault(logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -53,6 +69,7 @@ func Run(spec Spec) error {
 		return fmt.Errorf("MYSQL_DSN 格式错误: %w", err)
 	}
 	dbCfg.ParseTime, dbCfg.Loc, dbCfg.MultiStatements = true, time.UTC, false
+	dbCfg.ClientFoundRows = false // 库存流水用 RowsAffected 区分首次插入与重复调用。
 	if dbCfg.Params == nil {
 		dbCfg.Params = make(map[string]string)
 	}
@@ -67,8 +84,9 @@ func Run(spec Spec) error {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	checks := map[string]func(context.Context) error{"mysql": db.PingContext}
+	var rdb *redis.Client
 	if spec.Redis {
-		rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB,
+		rdb = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB,
 			DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, ContextTimeoutEnabled: true})
 		defer rdb.Close()
 		checks["redis"] = func(ctx context.Context) error { return rdb.Ping(ctx).Err() }
@@ -78,6 +96,7 @@ func Run(spec Spec) error {
 		checks["mq_nameserver_tcp"] = tcpCheck(cfg.Nameserver)
 		checks["mq_broker_tcp"] = tcpCheck(cfg.BrokerAddr)
 	}
+	connections := make(map[string]*grpc.ClientConn)
 	if spec.TradeClients {
 		for name, target := range map[string]string{"catalog_rpc": cfg.CatalogTarget, "payment_rpc": cfg.PaymentTarget} {
 			// ClientConn 长期复用。写操作未来显式指定业务重试，不安装全局重试拦截器。
@@ -87,6 +106,7 @@ func Run(spec Spec) error {
 				return fmt.Errorf("创建 %s 连接: %w", name, err)
 			}
 			defer conn.Close()
+			connections[name] = conn
 			client := healthpb.NewHealthClient(conn)
 			checks[name] = func(ctx context.Context) error {
 				res, err := client.Check(ctx, &healthpb.HealthCheckRequest{})
@@ -107,6 +127,49 @@ func Run(spec Spec) error {
 	}
 	var draining atomic.Bool
 	router := httpx.NewRouter(logger)
+	rpcServer := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		reply, err := handler(ctx, req)
+		if err == nil {
+			return reply, nil
+		}
+		logger.Warn("rpc_failed", "method", info.FullMethod, "error", err)
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, status.Error(codes.NotFound, "对象不存在")
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, status.Error(codes.DeadlineExceeded, "调用超时，需按业务键回查")
+		case errors.Is(err, context.Canceled):
+			return nil, status.Error(codes.Canceled, "调用已取消，需按业务键回查")
+		default:
+			return nil, status.Error(codes.Unavailable, "服务依赖暂不可用")
+		}
+	}))
+	defer rpcServer.Stop()
+	var stopBusiness func(context.Context) error
+	businessStopped := false
+	if spec.Configure != nil {
+		stopBusiness, err = spec.Configure(&Runtime{Config: cfg, DB: db, Router: router, RPC: rpcServer,
+			CatalogConn: connections["catalog_rpc"], PaymentConn: connections["payment_rpc"], Logger: logger, Redis: rdb})
+		if err != nil {
+			return fmt.Errorf("装配业务: %w", err)
+		}
+	}
+	// 即使后续监听失败，也要回收已经启动的后台任务与 MQ 连接。
+	if stopBusiness != nil {
+		defer func() {
+			if businessStopped {
+				return
+			}
+			stopCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			if err := stopBusiness(stopCtx); err != nil {
+				logger.Warn("business_stop_failed", "error", err)
+			}
+		}()
+	}
 	router.GET("/livez", func(c *gin.Context) { httpx.Write(c, 200, "OK", "进程存活", nil) })
 	router.GET("/readyz", func(c *gin.Context) {
 		if draining.Load() {
@@ -119,7 +182,7 @@ func Run(spec Spec) error {
 			httpx.Write(c, 503, "DEPENDENCY_UNAVAILABLE", "依赖尚未就绪", failed)
 			return
 		}
-		httpx.Write(c, 200, "OK", "基础设施就绪", gin.H{"service": spec.Name, "stage": "M1_FRAMEWORK"})
+		httpx.Write(c, 200, "OK", "服务就绪", gin.H{"service": spec.Name, "stage": "M1"})
 	})
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
@@ -129,7 +192,6 @@ func Run(spec Spec) error {
 	}
 	defer httpListener.Close()
 	serverErrors := make(chan error, 2)
-	var rpcServer *grpc.Server
 	var healthServer *health.Server
 	if spec.RPC {
 		listener, err := net.Listen("tcp", cfg.RPCAddr)
@@ -137,28 +199,37 @@ func Run(spec Spec) error {
 			return fmt.Errorf("监听 RPC: %w", err)
 		}
 		defer listener.Close()
-		rpcServer = grpc.NewServer()
 		healthServer = health.NewServer()
 		healthpb.RegisterHealthServer(rpcServer, healthServer)
-		// 框架阶段只注册标准健康协议；业务 RPC 尚未注册，调用会返回 Unimplemented。
+		// 标准健康协议与本服务的业务 RPC 共用同一监听。
 		healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 		go func() { serverErrors <- rpcServer.Serve(listener) }()
 	}
 	go func() { serverErrors <- httpServer.Serve(httpListener) }()
-	logger.Info("service_started", "httpAddr", cfg.HTTPAddr, "rpcEnabled", spec.RPC, "stage", "M1_FRAMEWORK")
+	logger.Info("service_started", "httpAddr", cfg.HTTPAddr, "rpcEnabled", spec.RPC, "stage", "M1")
 	var serveErr error
 	select {
 	case <-ctx.Done():
 	case serveErr = <-serverErrors:
 	}
 
-	// # 退出阶段：先撤销就绪，再排空监听，最后由 defer 关闭依赖连接。
+	// # 退出阶段：撤销就绪，停止后台领取并排空监听，共用同一个排空预算。
 	draining.Store(true)
 	if healthServer != nil {
 		healthServer.Shutdown()
 	}
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	businessDone := make(chan struct{})
+	businessStopped = true
+	go func() {
+		defer close(businessDone)
+		if stopBusiness != nil {
+			if err := stopBusiness(drainCtx); err != nil {
+				logger.Warn("business_drain_timeout", "error", err)
+			}
+		}
+	}()
 	rpcDone := make(chan struct{})
 	go func() {
 		if rpcServer != nil {
@@ -177,6 +248,10 @@ func Run(spec Spec) error {
 			rpcServer.Stop()
 			<-rpcDone
 		}
+	}
+	select {
+	case <-businessDone:
+	case <-drainCtx.Done():
 	}
 	logger.Info("service_stopped")
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) && !errors.Is(serveErr, grpc.ErrServerStopped) {

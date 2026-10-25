@@ -12,6 +12,7 @@ RUN go build -trimpath -o /out/user ./cmd/user \
     && go build -trimpath -o /out/payment ./cmd/payment \
     && go build -trimpath -o /out/seed ./cmd/seed \
     && go build -trimpath -o /out/mqcheck ./cmd/mqcheck \
+    && go build -trimpath -o /out/diagnose ./cmd/diagnose \
     && go build -trimpath -o /out/healthcheck ./cmd/healthcheck
 
 FROM scratch

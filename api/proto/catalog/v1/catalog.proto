@@ -22,6 +22,8 @@ message SKU {
   string name = 2;
   int64 price_cent = 3;
   bool available = 4;
+  // stock_available 供发布活动时校验额度；最终仍以 Reserve 的原子扣减为准。
+  int32 stock_available = 5;
 }
 message InventoryRequest {
   string order_no = 1;
