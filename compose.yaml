@@ -1,0 +1,197 @@
+name: dingdong
+
+x-app: &app
+  image: dingdong-go:dev
+  build:
+    context: .
+    args:
+      GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+  restart: unless-stopped
+  stop_grace_period: 20s
+  healthcheck:
+    test: [CMD, /app/healthcheck]
+    interval: 10s
+    timeout: 4s
+    retries: 6
+    start_period: 20s
+
+x-env: &env
+  HTTP_ADDR: :8080
+  RPC_ADDR: :9000
+  REDIS_ADDR: redis:6379
+  ROCKETMQ_NAMESERVER: rmq-nameserver:9876
+  ROCKETMQ_BROKER_ADDR: rmq-broker:10911
+  CATALOG_RPC_TARGET: dns:///catalog-service:9000
+  PAYMENT_RPC_TARGET: dns:///payment-service:9000
+
+services:
+  mysql:
+    image: mysql:8.4.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?先复制 .env.example 为 .env}
+      TZ: UTC
+    ports: ["127.0.0.1:13306:3306"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 强制 TCP，避免首次初始化期间误把临时 socket 服务当作已就绪。
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysql -h 127.0.0.1 -uroot -e "SELECT 1"']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.2-alpine
+    command: [redis-server, --appendonly, "yes"]
+    ports: ["127.0.0.1:16379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rmq-nameserver:
+    image: apache/rocketmq:4.9.8
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: -Xms128m -Xmx128m -Xmn64m
+    ports: ["127.0.0.1:19876:9876"]
+    restart: unless-stopped
+
+  rmq-broker:
+    image: apache/rocketmq:4.9.8
+    ports: ["127.0.0.1:10911:10911"]
+    command: sh mqbroker -c /home/rocketmq/broker.conf
+    environment:
+      NAMESRV_ADDR: rmq-nameserver:9876
+      JAVA_OPT_EXT: -Xms256m -Xmx256m -Xmn128m
+    depends_on: [rmq-nameserver]
+    volumes:
+      - ./deploy/rocketmq/broker.conf:/home/rocketmq/broker.conf:ro
+      - rocketmq-data:/home/rocketmq/store
+    restart: unless-stopped
+
+  mq-init:
+    image: apache/rocketmq:4.9.8
+    depends_on: [rmq-broker]
+    environment:
+      JAVA_OPT_EXT: -Xms64m -Xmx128m
+    # Broker 注册有延迟；创建显式 Topic，最多等待约 2 分钟，不无限等待。
+    entrypoint: [sh, -ec]
+    command:
+      - |
+        i=0
+        until sh mqadmin updateTopic -n rmq-nameserver:9876 -b rmq-broker:10911 -t dingdong-framework-check -r 1 -w 1; do
+          i=$$((i+1))
+          if [ "$$i" -ge 30 ]; then echo 'RocketMQ topic initialization failed' >&2; exit 1; fi
+          sleep 3
+        done
+
+  migrate-user:
+    image: migrate/migrate:v4.18.2
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes: [./migrations/user:/migrations:ro]
+    command: [-path, /migrations, -database, "mysql://migrate_user:demo-migrate-user@tcp(mysql:3306)/dingdong_user", up]
+
+  migrate-catalog:
+    image: migrate/migrate:v4.18.2
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes: [./migrations/catalog:/migrations:ro]
+    command: [-path, /migrations, -database, "mysql://migrate_catalog:demo-migrate-catalog@tcp(mysql:3306)/dingdong_catalog", up]
+
+  migrate-trade:
+    image: migrate/migrate:v4.18.2
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes: [./migrations/trade:/migrations:ro]
+    command: [-path, /migrations, -database, "mysql://migrate_trade:demo-migrate-trade@tcp(mysql:3306)/dingdong_trade", up]
+
+  migrate-payment:
+    image: migrate/migrate:v4.18.2
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes: [./migrations/payment:/migrations:ro]
+    command: [-path, /migrations, -database, "mysql://migrate_payment:demo-migrate-payment@tcp(mysql:3306)/dingdong_payment", up]
+
+  user-service:
+    <<: *app
+    command: [/app/user]
+    environment:
+      <<: *env
+      MYSQL_DSN: dingdong_user:demo-user@tcp(mysql:3306)/dingdong_user
+    ports: ["127.0.0.1:18080:8080"]
+    depends_on:
+      migrate-user: {condition: service_completed_successfully}
+
+  catalog-service:
+    <<: *app
+    command: [/app/catalog]
+    environment:
+      <<: *env
+      MYSQL_DSN: dingdong_catalog:demo-catalog@tcp(mysql:3306)/dingdong_catalog
+    ports: ["127.0.0.1:18081:8080", "127.0.0.1:19000:9000"]
+    depends_on:
+      migrate-catalog: {condition: service_completed_successfully}
+
+  payment-service:
+    <<: *app
+    command: [/app/payment]
+    environment:
+      <<: *env
+      MYSQL_DSN: dingdong_payment:demo-payment@tcp(mysql:3306)/dingdong_payment
+    ports: ["127.0.0.1:18083:8080", "127.0.0.1:19001:9000"]
+    depends_on:
+      migrate-payment: {condition: service_completed_successfully}
+      mq-init: {condition: service_completed_successfully}
+
+  trade-service:
+    <<: *app
+    command: [/app/trade]
+    environment:
+      <<: *env
+      MYSQL_DSN: dingdong_trade:demo-trade@tcp(mysql:3306)/dingdong_trade
+    ports: ["127.0.0.1:18082:8080"]
+    depends_on:
+      migrate-trade: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      catalog-service: {condition: service_healthy}
+      payment-service: {condition: service_healthy}
+
+  seed-user:
+    image: dingdong-go:dev
+    profiles: [tools]
+    command: [/app/seed, -service, user]
+    environment:
+      MYSQL_DSN: dingdong_user:demo-user@tcp(mysql:3306)/dingdong_user
+      DEMO_PASSWORD: ${DEMO_PASSWORD:?先在 .env 中配置 DEMO_PASSWORD}
+    depends_on:
+      migrate-user: {condition: service_completed_successfully}
+
+  seed-catalog:
+    image: dingdong-go:dev
+    profiles: [tools]
+    command: [/app/seed, -service, catalog]
+    environment:
+      MYSQL_DSN: dingdong_catalog:demo-catalog@tcp(mysql:3306)/dingdong_catalog
+    depends_on:
+      migrate-catalog: {condition: service_completed_successfully}
+
+  mqcheck:
+    image: dingdong-go:dev
+    profiles: [tools]
+    command: [/app/mqcheck]
+    environment:
+      ROCKETMQ_NAMESERVER: rmq-nameserver:9876
+    depends_on:
+      mq-init: {condition: service_completed_successfully}
+
+volumes:
+  mysql-data:
+  redis-data:
+  rocketmq-data:

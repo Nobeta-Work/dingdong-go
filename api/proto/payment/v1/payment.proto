@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package dingdong.payment.v1;
+option go_package = "github.com/Nobeta-Work/dingdong-go/api/gen/payment/v1;paymentv1";
+
+// Payment 只在内部网络提供编排接口，模拟确认仍需 HTTP 用户鉴权。
+service Payment {
+  rpc CreateOrGet(CreatePaymentRequest) returns (PaymentRecord);
+  rpc QueryByOrder(OrderRequest) returns (PaymentRecord);
+  rpc CloseByOrder(OrderRequest) returns (PaymentRecord);
+}
+
+message CreatePaymentRequest {
+  string order_no = 1;
+  string user_id = 2;
+  int64 amount_cent = 3;
+  // expires_at_unix_milli 为 UTC Unix 毫秒，与 API 的 ISO 8601 表达分离。
+  int64 expires_at_unix_milli = 4;
+}
+message OrderRequest { string order_no = 1; }
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_PENDING = 1;
+  PAYMENT_STATUS_SUCCESS = 2;
+  PAYMENT_STATUS_CLOSED = 3;
+}
+message PaymentRecord {
+  string payment_no = 1;
+  string order_no = 2;
+  string user_id = 3;
+  int64 amount_cent = 4;
+  int64 expires_at_unix_milli = 5;
+  PaymentStatus status = 6;
+}

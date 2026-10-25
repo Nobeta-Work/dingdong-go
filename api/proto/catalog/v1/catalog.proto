@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package dingdong.catalog.v1;
+option go_package = "github.com/Nobeta-Work/dingdong-go/api/gen/catalog/v1;catalogv1";
+
+// Catalog 管理商品读取；业务 ID 使用字符串，金额以分表示。
+service Catalog {
+  rpc GetSKU(GetSKURequest) returns (SKU);
+}
+
+// Inventory 通过 order_no 幂等操作库存，业务拒绝应映射为明确的 gRPC 状态码。
+service Inventory {
+  rpc Reserve(InventoryRequest) returns (Reservation);
+  rpc GetReservation(ReservationRequest) returns (Reservation);
+  rpc Confirm(ReservationRequest) returns (Reservation);
+  rpc Release(InventoryRequest) returns (Reservation);
+}
+
+message GetSKURequest { string sku_id = 1; }
+message SKU {
+  string sku_id = 1;
+  string name = 2;
+  int64 price_cent = 3;
+  bool available = 4;
+}
+message InventoryRequest {
+  string order_no = 1;
+  string sku_id = 2;
+  int32 quantity = 3;
+}
+message ReservationRequest {
+  string order_no = 1;
+  string sku_id = 2;
+}
+enum ReservationStatus {
+  RESERVATION_STATUS_UNSPECIFIED = 0;
+  RESERVATION_STATUS_LOCKED = 1;
+  RESERVATION_STATUS_CONFIRMED = 2;
+  RESERVATION_STATUS_RELEASED = 3;
+}
+message Reservation {
+  string order_no = 1;
+  string sku_id = 2;
+  int32 quantity = 3;
+  ReservationStatus status = 4;
+}

@@ -1,2 +1,8 @@
 # Document
 docs/
+
+# Local configuration and build output
+.env
+bin/
+.cache/
+*.exe
